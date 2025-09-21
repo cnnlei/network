@@ -1,0 +1,23 @@
+ip_lists:
+    admin-ips:
+        - 127.0.0.1
+        - 192.168.0.0/16
+    blocked-ips:
+        - 8.8.8.8
+rules:
+    - name: my-rdp-rule
+      protocol: tcp
+      listen_port: 2223
+      forward_addr: 192.168.122.250
+      forward_port: 3389
+      access_control:
+        mode: disabled
+        list_name: admin-ips
+    - name: dns-udp-rule
+      protocol: udp
+      listen_port: 53536
+      forward_addr: 8.8.8.8
+      forward_port: 53
+      access_control:
+        mode: disabled
+        list_name: ""
