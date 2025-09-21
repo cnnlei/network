@@ -19,13 +19,14 @@ const connectWebSocket = () => {
   const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
   socket = new WebSocket(`${wsProtocol}//${window.location.hostname}:8080/ws`);
   socket.onmessage = (event) => {
-    try {
-      const payload = JSON.parse(event.data);
-      if (payload.recentLogs !== undefined) {
-        historicalLogs.value = payload.recentLogs || '暂无最新日志。';
-      }
-    } catch (e) { console.error("解析WebSocket数据失败:", e); }
-  };
+  try {
+    const payload = JSON.parse(event.data);
+    // 只有在 payload 中明确包含 recentLogs 字段时才更新
+    if (payload.recentLogs !== undefined && payload.recentLogs !== null) {
+      historicalLogs.value = payload.recentLogs || '暂无最新日志。';
+    }
+  } catch (e) { console.error("解析WebSocket数据失败:", e); }
+};
   socket.onclose = () => setTimeout(connectWebSocket, 3000);
   socket.onerror = (error) => { console.error('WebSocket Error:', error); socket.close(); };
 };
