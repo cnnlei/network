@@ -1,3 +1,9 @@
+global_access_control:
+    mode: blacklist_only
+    whitelist_enabled: false
+    whitelist_list_name: ""
+    blacklist_enabled: true
+    blacklist_list_name: blocked-ips
 ip_lists:
     admin-ips:
         - 127.0.0.1
@@ -5,19 +11,23 @@ ip_lists:
     blocked-ips:
         - 8.8.8.8
 rules:
-    - name: my-rdp-rule
-      protocol: tcp
+    - name: test-all
+      protocol: tcp,udp
+      listen_addr: 0.0.0.0
       listen_port: 2223
       forward_addr: 192.168.122.250
       forward_port: 3389
       access_control:
         mode: disabled
         list_name: admin-ips
-    - name: dns-udp-rule
+      enabled: true
+    - name: test-tcp01
       protocol: udp
+      listen_addr: ""
       listen_port: 53536
       forward_addr: 8.8.8.8
       forward_port: 53
       access_control:
         mode: disabled
         list_name: ""
+      enabled: true

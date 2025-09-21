@@ -1,3 +1,4 @@
+// cnnlei/network/network-33ab537e85847c302b55c126d843f77b047a1244/udp_forwarder.go
 package main
 
 import (
@@ -17,13 +18,19 @@ type udpSession struct {
 }
 
 func startUDPForwarder(rule Rule, manager *ConnectionManager, ipFilterManager *IPFilterManager) {
-	listenAddr, err := net.ResolveUDPAddr("udp", rule.ListenAddress())
-	if err != nil { log.Fatalf("致命错误: 无法解析UDP监听地址 [%s]: %v", rule.Name, err); return }
+	listenAddr, err := net.ResolveUDPAddr(rule.Protocol, rule.ListenAddress())
+	if err != nil {
+		log.Printf("错误: 无法解析UDP监听地址 [%s] (%s): %v", rule.Name, rule.Protocol, err)
+		return
+	}
 	
-	conn, err := net.ListenUDP("udp", listenAddr)
-	if err != nil { log.Fatalf("致命错误: 无法为规则 [%s] 监听UDP端口 %s: %v", rule.Name, rule.ListenAddress(), err); return }
+	conn, err := net.ListenUDP(rule.Protocol, listenAddr)
+	if err != nil {
+		log.Printf("错误: 无法为规则 [%s] 监听UDP端口 %s (%s): %v", rule.Name, rule.ListenAddress(), rule.Protocol, err)
+		return
+	}
 	defer conn.Close()
-	log.Printf("==== 规则 [%s] 已启动并成功监听UDP在 %s ====", rule.Name, rule.ListenAddress())
+	log.Printf("==== 规则 [%s] 已启动并成功监听UDP在 %s (%s) ====", rule.Name, rule.ListenAddress(), rule.Protocol)
 
 	sessions := make(map[string]*udpSession)
 	var mu sync.Mutex
@@ -51,11 +58,14 @@ func startUDPForwarder(rule Rule, manager *ConnectionManager, ipFilterManager *I
 		if err != nil { continue }
 
 		clientIP := clientAddr.IP.String()
-		if !ipFilterManager.IsAllowed(clientIP, rule.AccessControl) {
-			log.Printf("[%s] 已拒绝来自 %s 的UDP数据包 (访问控制)", rule.Name, clientIP)
+
+		// 统一调用新的检查函数
+		allowed, reason := ipFilterManager.IsAllowed(clientIP, rule.AccessControl)
+		if !allowed {
+			log.Printf("[%s] 已拒绝来自 %s 的UDP数据包: %s", rule.Name, clientIP, reason)
 			continue
 		}
-
+		
 		mu.Lock()
 		session, found := sessions[clientAddr.String()]
 		if !found {

@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -14,10 +15,13 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// 修改 BroadcastPayload 结构，加入按规则分类的日志
 type BroadcastPayload struct {
-	Connections []*ConnectionInfo `json:"connections"`
-	RecentLogs  string            `json:"recentLogs"`
+	Connections      []*ConnectionInfo   `json:"connections"`
+	RecentLogs       string              `json:"recentLogs"`
+	RecentLogsByRule map[string][]string `json:"recentLogsByRule"`
 }
+
 type ConnectionInfo struct {
 	ID         int64     `json:"ID"`
 	Protocol   string    `json:"Protocol"`
@@ -25,8 +29,8 @@ type ConnectionInfo struct {
 	ClientAddr string    `json:"ClientAddr"`
 	TargetAddr string    `json:"TargetAddr"`
 	StartTime  time.Time `json:"startTime"`
-	clientConn net.Conn `json:"-"`
-	targetConn net.Conn `json:"-"`
+	clientConn net.Conn  `json:"-"`
+	targetConn net.Conn  `json:"-"`
 }
 type ConnectionManager struct {
 	connections map[int64]*ConnectionInfo
@@ -43,16 +47,40 @@ func NewConnectionManager() *ConnectionManager {
 	}
 }
 
-func readLastNLines(filePath string, n int) (string, error) {
+// 修改函数，使其能同时返回所有最新日志和按规则分类的日志
+func readRecentLogs(filePath string, n int) (string, map[string][]string, error) {
 	file, err := os.Open(filePath)
-	if err != nil { return "", err }
+	if err != nil {
+		return "", nil, err
+	}
 	defer file.Close()
-	var lines []string
+
+	var allLines []string
 	scanner := bufio.NewScanner(file)
-	for scanner.Scan() { lines = append(lines, scanner.Text()) }
-	start := len(lines) - n
-	if start < 0 { start = 0 }
-	return strings.Join(lines[start:], "\n"), scanner.Err()
+	for scanner.Scan() {
+		allLines = append(allLines, scanner.Text())
+	}
+
+	start := len(allLines) - n
+	if start < 0 {
+		start = 0
+	}
+	recentLines := allLines[start:]
+
+	logsByRule := make(map[string][]string)
+	re := regexp.MustCompile(`\[([^\]]+)\]`)
+
+	for _, line := range recentLines {
+		matches := re.FindStringSubmatch(line)
+		if len(matches) > 1 {
+			ruleName := matches[1]
+			if ruleName != "Manager" && ruleName != "IPFilter" {
+				logsByRule[ruleName] = append(logsByRule[ruleName], line)
+			}
+		}
+	}
+
+	return strings.Join(recentLines, "\n"), logsByRule, scanner.Err()
 }
 
 func (m *ConnectionManager) Add(protocol, rule string, clientConn, targetConn net.Conn) int64 {
@@ -61,9 +89,13 @@ func (m *ConnectionManager) Add(protocol, rule string, clientConn, targetConn ne
 	connID := m.nextConnID
 	m.nextConnID++
 	clientAddr := "pending..."
-	if clientConn != nil { clientAddr = clientConn.RemoteAddr().String() }
+	if clientConn != nil {
+		clientAddr = clientConn.RemoteAddr().String()
+	}
 	targetAddr := "pending..."
-	if targetConn != nil { targetAddr = targetConn.RemoteAddr().String() }
+	if targetConn != nil {
+		targetAddr = targetConn.RemoteAddr().String()
+	}
 	m.connections[connID] = &ConnectionInfo{
 		ID:         connID,
 		Protocol:   protocol,
@@ -84,14 +116,14 @@ func (m *ConnectionManager) Remove(id int64) {
 }
 
 func (m *ConnectionManager) UpdateTargetConn(id int64, targetConn net.Conn) {
-    m.mu.Lock()
-    defer m.mu.Unlock()
-    if conn, ok := m.connections[id]; ok {
-        conn.targetConn = targetConn
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if conn, ok := m.connections[id]; ok {
+		conn.targetConn = targetConn
 		if targetConn != nil {
 			conn.TargetAddr = targetConn.RemoteAddr().String()
 		}
-    }
+	}
 }
 
 func (m *ConnectionManager) Disconnect(id int64) bool {
@@ -100,8 +132,12 @@ func (m *ConnectionManager) Disconnect(id int64) bool {
 	m.mu.Unlock()
 	if ok {
 		log.Printf("[Manager] 正在断开连接 ID: %d", id)
-		if conn.clientConn != nil { conn.clientConn.Close() }
-		if conn.targetConn != nil { conn.targetConn.Close() }
+		if conn.clientConn != nil {
+			conn.clientConn.Close()
+		}
+		if conn.targetConn != nil {
+			conn.targetConn.Close()
+		}
 		return true
 	}
 	return false
@@ -119,12 +155,21 @@ func (m *ConnectionManager) GetAll() []*ConnectionInfo {
 
 func (m *ConnectionManager) Broadcast() {
 	conns := m.GetAll()
-	logs, err := readLastNLines("forwarder.log", 50)
-	if err != nil { log.Printf("[Manager] 读取最新日志失败: %v", err) }
+	recentLogs, logsByRule, err := readRecentLogs("forwarder.log", 50)
+	if err != nil {
+		log.Printf("[Manager] 读取最新日志失败: %v", err)
+	}
 
-	payload := BroadcastPayload{ Connections: conns, RecentLogs: logs }
+	payload := BroadcastPayload{
+		Connections:      conns,
+		RecentLogs:       recentLogs,
+		RecentLogsByRule: logsByRule,
+	}
 	data, err := json.Marshal(payload)
-	if err != nil { log.Printf("[Manager] Broadcast JSON 序列化失败: %v", err); return }
+	if err != nil {
+		log.Printf("[Manager] Broadcast JSON 序列化失败: %v", err)
+		return
+	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -137,19 +182,22 @@ func (m *ConnectionManager) Broadcast() {
 	}
 }
 
-var upgrader = websocket.Upgrader{ CheckOrigin: func(r *http.Request) bool { return true } }
+var upgrader = websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 
 func (m *ConnectionManager) ServeWs(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil { log.Printf("WebSocket升级失败: %v", err); return }
-	
+	if err != nil {
+		log.Printf("WebSocket升级失败: %v", err)
+		return
+	}
+
 	m.mu.Lock()
 	m.clients[conn] = true
 	m.mu.Unlock()
 	log.Println("[Manager] 新的WebSocket客户端已连接")
-	
+
 	go m.Broadcast()
-	
+
 	for {
 		if _, _, err := conn.ReadMessage(); err != nil {
 			m.mu.Lock()
