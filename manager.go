@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -25,11 +26,11 @@ type ConnectionInfo struct {
 	ID         int64     `json:"id"`
 	Protocol   string    `json:"protocol"`
 	Rule       string    `json:"rule"`
+	SubRule    string    `json:"sub_rule,omitempty"`
 	ClientAddr string    `json:"clientAddr"`
 	TargetAddr string    `json:"targetAddr"`
 	StartTime  time.Time `json:"startTime"`
-	clientConn net.Conn  `json:"-"`
-	targetConn net.Conn  `json:"-"`
+	conn       net.Conn  `json:"-"`
 }
 type ConnectionManager struct {
 	connections map[int64]*ConnectionInfo
@@ -71,9 +72,9 @@ func readRecentLogs(filePath string, n int) (string, map[string][]string, error)
 	for _, line := range recentLines {
 		matches := re.FindStringSubmatch(line)
 		if len(matches) > 1 {
-			ruleName := matches[1]
-			if ruleName != "Manager" && ruleName != "IPFilter" {
-				logsByRule[ruleName] = append(logsByRule[ruleName], line)
+			fullRuleName := matches[1]
+			if !strings.HasPrefix(fullRuleName, "Manager") && !strings.HasPrefix(fullRuleName, "IPFilter") {
+				logsByRule[fullRuleName] = append(logsByRule[fullRuleName], line)
 			}
 		}
 	}
@@ -84,8 +85,8 @@ func readRecentLogs(filePath string, n int) (string, map[string][]string, error)
 func (m *ConnectionManager) Add(protocol, rule string, clientConn, targetConn net.Conn) int64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	connID := m.nextConnID
-	m.nextConnID++
+	connID := atomic.AddInt64(&m.nextConnID, 1)
+
 	clientAddr := "pending..."
 	if clientConn != nil {
 		clientAddr = clientConn.RemoteAddr().String()
@@ -94,6 +95,7 @@ func (m *ConnectionManager) Add(protocol, rule string, clientConn, targetConn ne
 	if targetConn != nil {
 		targetAddr = targetConn.RemoteAddr().String()
 	}
+
 	m.connections[connID] = &ConnectionInfo{
 		ID:         connID,
 		Protocol:   protocol,
@@ -101,10 +103,27 @@ func (m *ConnectionManager) Add(protocol, rule string, clientConn, targetConn ne
 		ClientAddr: clientAddr,
 		TargetAddr: targetAddr,
 		StartTime:  time.Now(),
-		clientConn: clientConn,
-		targetConn: targetConn,
+		conn:       clientConn,
 	}
 	return connID
+}
+
+// AddHTTPConn adds a connection from an HTTP server
+func (m *ConnectionManager) AddHTTPConn(conn net.Conn, ruleName, subRuleName string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	connID := atomic.AddInt64(&m.nextConnID, 1)
+
+	m.connections[connID] = &ConnectionInfo{
+		ID:         connID,
+		Protocol:   "WEB",
+		Rule:       ruleName,
+		SubRule:    subRuleName,
+		ClientAddr: conn.RemoteAddr().String(),
+		TargetAddr: conn.LocalAddr().String(),
+		StartTime:  time.Now(),
+		conn:       conn,
+	}
 }
 
 func (m *ConnectionManager) Remove(id int64) {
@@ -113,11 +132,26 @@ func (m *ConnectionManager) Remove(id int64) {
 	delete(m.connections, id)
 }
 
+// RemoveByConn removes a connection using the net.Conn object as a key
+func (m *ConnectionManager) RemoveByConn(conn net.Conn) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var idToRemove int64 = -1
+	for id, c := range m.connections {
+		if c.conn == conn {
+			idToRemove = id
+			break
+		}
+	}
+	if idToRemove != -1 {
+		delete(m.connections, idToRemove)
+	}
+}
+
 func (m *ConnectionManager) UpdateTargetConn(id int64, targetConn net.Conn) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if conn, ok := m.connections[id]; ok {
-		conn.targetConn = targetConn
 		if targetConn != nil {
 			conn.TargetAddr = targetConn.RemoteAddr().String()
 		}
@@ -130,11 +164,8 @@ func (m *ConnectionManager) Disconnect(id int64) bool {
 	m.mu.Unlock()
 	if ok {
 		log.Printf("[Manager] 正在断开连接 ID: %d", id)
-		if conn.clientConn != nil {
-			conn.clientConn.Close()
-		}
-		if conn.targetConn != nil {
-			conn.targetConn.Close()
+		if conn.conn != nil {
+			conn.conn.Close()
 		}
 		return true
 	}
@@ -155,7 +186,10 @@ func (m *ConnectionManager) Broadcast() {
 	conns := m.GetAll()
 	recentLogs, logsByRule, err := readRecentLogs("forwarder.log", 50)
 	if err != nil {
-		log.Printf("[Manager] 读取最新日志失败: %v", err)
+		// Don't log error if file doesn't exist yet
+		if !os.IsNotExist(err) {
+			log.Printf("[Manager] 读取最新日志失败: %v", err)
+		}
 	}
 
 	payload := BroadcastPayload{

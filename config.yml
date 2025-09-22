@@ -166,3 +166,74 @@ rules:
         mode: disabled
         list_name: ""
       enabled: true
+web_services:
+    - name: test-web
+      enabled: true
+      listen_ipv4: true
+      listen_ipv6: true
+      listen_addr: ""
+      listen_port: 81
+      access_control:
+        mode: disabled
+        list_name: ""
+      security:
+        block_on_404_count: 0
+        block_on_block_count: 0
+      tls:
+        enabled: false
+        force_https: true
+        min_version: TLS1.2
+        http3_enabled: false
+        ech_enabled: false
+      apply_to_sub_rules: false
+      limits:
+        rule_rate_limit:
+            send_speed_kbps: 0
+            receive_speed_kbps: 0
+        connection_rate_limit:
+            send_speed_kbps: 0
+            receive_speed_kbps: 0
+        ip_rate_limit:
+            send_speed_kbps: 0
+            receive_speed_kbps: 0
+        ip_connection_limit: 0
+      sub_rules:
+        - name: "01"
+          enabled: true
+          operation_mode: custom
+          tag: ""
+          service_type: reverse_proxy
+          frontend_address: cnyun.de
+          backend:
+            address: http://1.13.161.181:38707
+            ignore_tls_cert: false
+            use_target_host_header: false
+            grpc_secure: false
+            disable_keep_alives: false
+          redirect_url: ""
+          coraza_waf: 无
+          security:
+            block_on_404_count: 0
+            block_on_coraza_count: 0
+          network:
+            disable_connection_reuse: false
+            network_type: tcp
+            http_client_timeout_sec: 30
+          client_ip:
+            from_header: false
+            add_to_header: false
+            add_to_header_name: X-Forwarded-For
+            add_proto_to_header: false
+            add_proto_to_header_name: X-Forwarded-Proto
+          cors_enabled: false
+          auth:
+            enabled: false
+            username: ""
+            password: ""
+          ip_filter:
+            mode: disabled
+            list_name: ""
+          user_agent_filter:
+            mode: disabled
+            list: []
+          custom_robot_txt: ""

@@ -25,6 +25,7 @@ var (
 	currentConfig    *Config
 	ipFilterManager  *IPFilterManager
 	forwarderManager *ForwarderManager
+	webManager       *WebManager
 	updater          *Updater
 	configPath       = flag.String("config", "config.yml", "Path to the main configuration file (config.yml)")
 )
@@ -250,6 +251,7 @@ rules:
   access_control:
     mode: disabled
   enabled: true
+web_services: []
 `)
 		if err := os.WriteFile(*configPath, exampleConfig, 0644); err != nil {
 			log.Fatalf("创建示例 config.yml 失败: %v", err)
@@ -284,6 +286,7 @@ rules:
 	ipFilterManager = NewIPFilterManager(currentConfig)
 	connManager := NewConnectionManager()
 	forwarderManager = NewForwarderManager(connManager, ipFilterManager)
+	webManager = NewWebManager(ipFilterManager, connManager)
 	updater = NewUpdater(ipFilterManager)
 
 	updater.Start()
@@ -292,11 +295,17 @@ rules:
 	for _, rule := range currentConfig.Rules {
 		if rule.Enabled {
 			forwarderManager.StartRule(rule)
-		} else {
-			log.Printf("规则 [%s] 已被禁用，跳过启动。", rule.Name)
 		}
 	}
-	log.Println("所有转发器已在后台启动。")
+	
+	log.Println("准备启动Web服务...")
+	for _, rule := range currentConfig.WebServices {
+		if rule.Enabled {
+			webManager.StartRule(rule)
+		}
+	}
+
+	log.Println("所有服务已在后台启动。")
 
 	router := gin.Default()
 	router.Use(cors.New(cors.Config{
@@ -352,6 +361,228 @@ rules:
 			c.JSON(http.StatusOK, gin.H{"message": "设置已保存。"})
 		})
 		
+		// --- Web Services APIs ---
+		api.GET("/web-rules", func(c *gin.Context) {
+			configMutex.RLock()
+			defer configMutex.RUnlock()
+			c.JSON(http.StatusOK, currentConfig.WebServices)
+		})
+
+		api.POST("/web-rules", func(c *gin.Context) {
+			var newRule WebServiceRule
+			if err := c.ShouldBindJSON(&newRule); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "无效的规则数据: " + err.Error()})
+				return
+			}
+			configMutex.Lock()
+			defer configMutex.Unlock()
+			for _, r := range currentConfig.WebServices {
+				if r.Name == newRule.Name {
+					c.JSON(http.StatusConflict, gin.H{"error": "Web服务规则名称 '" + newRule.Name + "' 已存在"})
+					return
+				}
+			}
+			currentConfig.WebServices = append(currentConfig.WebServices, newRule)
+			data, _ := yaml.Marshal(currentConfig)
+			os.WriteFile(*configPath, data, 0644)
+			webManager.StartRule(newRule)
+			log.Printf("[Manager] 已添加并启动新的Web服务规则 [%s]", newRule.Name)
+			c.JSON(http.StatusOK, newRule)
+		})
+
+		api.PUT("/web-rules/:name", func(c *gin.Context) {
+			ruleName := c.Param("name")
+			var updatedRule WebServiceRule
+			if err := c.ShouldBindJSON(&updatedRule); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "无效的规则数据: " + err.Error()})
+				return
+			}
+			configMutex.Lock()
+			defer configMutex.Unlock()
+			
+			found := false
+			for i, r := range currentConfig.WebServices {
+				if r.Name == ruleName {
+					webManager.StopRule(r.Name)
+					currentConfig.WebServices[i] = updatedRule
+					found = true
+					break
+				}
+			}
+			if !found {
+				c.JSON(http.StatusNotFound, gin.H{"error": "未找到Web服务规则: " + ruleName})
+				return
+			}
+			webManager.StartRule(updatedRule)
+			log.Printf("[Manager] 已更新Web服务规则 [%s]", updatedRule.Name)
+			data, _ := yaml.Marshal(currentConfig)
+			os.WriteFile(*configPath, data, 0644)
+			c.JSON(http.StatusOK, updatedRule)
+		})
+
+		api.DELETE("/web-rules/:name", func(c *gin.Context) {
+			ruleName := c.Param("name")
+			configMutex.Lock()
+			defer configMutex.Unlock()
+			
+			webManager.StopRule(ruleName)
+			
+			foundIndex := -1
+			for i, r := range currentConfig.WebServices {
+				if r.Name == ruleName {
+					foundIndex = i
+					break
+				}
+			}
+			if foundIndex == -1 {
+				c.JSON(http.StatusNotFound, gin.H{"error": "未找到Web服务规则: " + ruleName})
+				return
+			}
+			currentConfig.WebServices = append(currentConfig.WebServices[:foundIndex], currentConfig.WebServices[foundIndex+1:]...)
+			data, _ := yaml.Marshal(currentConfig)
+			os.WriteFile(*configPath, data, 0644)
+			c.JSON(http.StatusOK, gin.H{"message": "Web服务规则 '" + ruleName + "' 已成功删除"})
+		})
+		
+		api.POST("/web-rules/:name/toggle", func(c *gin.Context) {
+			ruleName := c.Param("name")
+			configMutex.Lock()
+			defer configMutex.Unlock()
+			var newState bool
+			found := false
+			for i, r := range currentConfig.WebServices {
+				if r.Name == ruleName {
+					currentConfig.WebServices[i].Enabled = !r.Enabled
+					newState = currentConfig.WebServices[i].Enabled
+					
+					webManager.StopRule(r.Name)
+					if newState {
+						webManager.StartRule(currentConfig.WebServices[i])
+					}
+					
+					found = true
+					break
+				}
+			}
+			if !found {
+				c.JSON(http.StatusNotFound, gin.H{"error": "未找到Web服务规则: " + ruleName})
+				return
+			}
+			data, _ := yaml.Marshal(currentConfig)
+			os.WriteFile(*configPath, data, 0644)
+			c.JSON(http.StatusOK, gin.H{"message": "Web服务规则 '" + ruleName + "' 状态已切换", "enabled": newState})
+		})
+
+		// --- Web Sub-Rules APIs ---
+		api.POST("/web-rules/:name/sub-rules", func(c *gin.Context) {
+			ruleName := c.Param("name")
+			var subRule WebSubRule
+			if err := c.ShouldBindJSON(&subRule); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "无效的子规则数据: " + err.Error()})
+				return
+			}
+			configMutex.Lock()
+			defer configMutex.Unlock()
+
+			found := false
+			for i, r := range currentConfig.WebServices {
+				if r.Name == ruleName {
+					for _, sr := range r.SubRules {
+						if sr.Name == subRule.Name {
+							c.JSON(http.StatusConflict, gin.H{"error": "子规则名称 '" + subRule.Name + "' 已存在"})
+							return
+						}
+					}
+					currentConfig.WebServices[i].SubRules = append(r.SubRules, subRule)
+					found = true
+					break
+				}
+			}
+
+			if !found {
+				c.JSON(http.StatusNotFound, gin.H{"error": "未找到父规则: " + ruleName})
+				return
+			}
+			data, _ := yaml.Marshal(currentConfig)
+			os.WriteFile(*configPath, data, 0644)
+			c.JSON(http.StatusOK, subRule)
+		})
+
+		api.PUT("/web-rules/:name/sub-rules/:subRuleName", func(c *gin.Context) {
+			ruleName := c.Param("name")
+			subRuleName := c.Param("subRuleName")
+			var updatedSubRule WebSubRule
+			if err := c.ShouldBindJSON(&updatedSubRule); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "无效的子规则数据: " + err.Error()})
+				return
+			}
+			configMutex.Lock()
+			defer configMutex.Unlock()
+
+			parentFound := false
+			for i, r := range currentConfig.WebServices {
+				if r.Name == ruleName {
+					parentFound = true
+					subFound := false
+					for j, sr := range r.SubRules {
+						if sr.Name == subRuleName {
+							currentConfig.WebServices[i].SubRules[j] = updatedSubRule
+							subFound = true
+							break
+						}
+					}
+					if !subFound {
+						c.JSON(http.StatusNotFound, gin.H{"error": "未找到子规则: " + subRuleName})
+						return
+					}
+					break
+				}
+			}
+
+			if !parentFound {
+				c.JSON(http.StatusNotFound, gin.H{"error": "未找到父规则: " + ruleName})
+				return
+			}
+			data, _ := yaml.Marshal(currentConfig)
+			os.WriteFile(*configPath, data, 0644)
+			c.JSON(http.StatusOK, updatedSubRule)
+		})
+
+		api.DELETE("/web-rules/:name/sub-rules/:subRuleName", func(c *gin.Context) {
+			ruleName := c.Param("name")
+			subRuleName := c.Param("subRuleName")
+			configMutex.Lock()
+			defer configMutex.Unlock()
+
+			parentFound := false
+			for i, r := range currentConfig.WebServices {
+				if r.Name == ruleName {
+					parentFound = true
+					foundIndex := -1
+					for j, sr := range r.SubRules {
+						if sr.Name == subRuleName {
+							foundIndex = j
+							break
+						}
+					}
+					if foundIndex == -1 {
+						c.JSON(http.StatusNotFound, gin.H{"error": "未找到子规则: " + subRuleName})
+						return
+					}
+					currentConfig.WebServices[i].SubRules = append(r.SubRules[:foundIndex], r.SubRules[foundIndex+1:]...)
+					break
+				}
+			}
+
+			if !parentFound {
+				c.JSON(http.StatusNotFound, gin.H{"error": "未找到父规则: " + ruleName})
+				return
+			}
+			data, _ := yaml.Marshal(currentConfig)
+			os.WriteFile(*configPath, data, 0644)
+			c.JSON(http.StatusOK, gin.H{"message": "子规则 '" + subRuleName + "' 已成功删除"})
+		})
+
 		// --- Rules APIs ---
 		api.GET("/rules", func(c *gin.Context) {
 			configMutex.RLock()
