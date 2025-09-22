@@ -8,6 +8,7 @@
         <h2>Go Forwarder</h2>
       </div>
       <nav class="navigation">
+        <router-link to="/web-service">Web 服务</router-link>
         <router-link to="/">端口转发</router-link>
         <router-link to="/ip-lists">IP 名单</router-link>
         <router-link to="/global-acl">全局访问控制</router-link>
