@@ -1,3 +1,45 @@
+settings:
+    log_directory: .
+    ip_list_directory: ./ip_lists
+    log:
+        cleanup_by_time:
+            enabled: false
+            mode: days
+            value: 7
+        cleanup_by_lines:
+            enabled: true
+            retain_lines: 10
+        cleanup_by_rule:
+            ceshi2:
+                enabled: false
+                retain_lines: 1000
+            ceshi3:
+                enabled: false
+                retain_lines: 1000
+            ceshi5:
+                enabled: false
+                retain_lines: 1000
+            ceshi8:
+                enabled: false
+                retain_lines: 1000
+            test-all:
+                enabled: false
+                retain_lines: 1000
+            test-tcp01:
+                enabled: false
+                retain_lines: 1000
+            测试:
+                enabled: false
+                retain_lines: 1000
+            测试1:
+                enabled: false
+                retain_lines: 1000
+            测试4:
+                enabled: false
+                retain_lines: 1000
+            端口转发:
+                enabled: false
+                retain_lines: 1000
 global_access_control:
     mode: priority
     whitelist_enabled: true
@@ -9,13 +51,19 @@ ip_lists:
         全局白名单:
             - 192.168.122.250
     blacklists:
-        全局黑名单: []
-    ip_sets: {}
+        全局黑名单:
+            - 2.2.2.2
+    ip_sets:
+        ipv:
+            - 192.168.122.250
     country_ip_lists:
         中国ip:
             type: country
             source: CN
-            update_interval: 60
+    url_ip_sets:
+        vn:
+            type: url
+            source: https://raw.githubusercontent.com/mayaxcn/china-ip-list/refs/heads/master/chn_ip.txt
 rules:
     - name: test-all
       protocol: tcp,udp

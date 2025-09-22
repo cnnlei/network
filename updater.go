@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -25,10 +27,10 @@ func NewUpdater(ipFilterManager *IPFilterManager) *Updater {
 }
 
 func (u *Updater) Start() {
-	log.Println("[Updater] 后台IP名单更新服务已启动，每分钟检查一次。")
-	u.ticker = time.NewTicker(1 * time.Minute)
+	updateInterval := 7 * 24 * time.Hour
+	log.Printf("[Updater] 后台IP名单更新服务已启动，每 %v 检查一次。", updateInterval)
+	u.ticker = time.NewTicker(updateInterval)
 	go func() {
-		// 立即执行一次
 		u.runUpdateCycle()
 
 		for {
@@ -48,12 +50,13 @@ func (u *Updater) Stop() {
 	close(u.stopChan)
 }
 
-// runUpdateCycle 检查所有需要更新的IP名单并执行更新
 func (u *Updater) runUpdateCycle() {
 	configMutex.RLock()
 	listsToUpdate := make(map[string]*IPListConfig)
-	// 只更新 country_ip_lists 分类下的名单
 	for name, listConfig := range currentConfig.IPLists.CountryIPLists {
+		listsToUpdate[name] = listConfig
+	}
+	for name, listConfig := range currentConfig.IPLists.UrlIpSets {
 		listsToUpdate[name] = listConfig
 	}
 	configMutex.RUnlock()
@@ -81,7 +84,6 @@ func (u *Updater) runUpdateCycle() {
 	}
 }
 
-// updateList 更新单个IP名单
 func (u *Updater) updateList(name string, listConfig *IPListConfig) error {
 	var newIPs []string
 	var err error
@@ -90,19 +92,35 @@ func (u *Updater) updateList(name string, listConfig *IPListConfig) error {
 	if listConfig.Type == "country" {
 		sourceUrl = "https://www.ipdeny.com/ipblocks/data/countries/" + strings.ToLower(listConfig.Source) + ".zone"
 	}
-	
+
 	newIPs, err = fetchIPsFromURL(sourceUrl)
 	if err != nil {
 		log.Printf("[Updater] 从 [%s] 获取名单 [%s] 失败: %v", sourceUrl, name, err)
 		return err
 	}
+
+	updateTime := time.Now()
+
+	configMutex.RLock()
+	ipListDir := currentConfig.Settings.IPListDirectory
+	configMutex.RUnlock()
+
+	if ipListDir != "" {
+		filePath := filepath.Join(ipListDir, name+".txt")
+		content := strings.Join(newIPs, "\n")
+		err := os.WriteFile(filePath, []byte(content), 0644)
+		if err != nil {
+			log.Printf("[Updater] 无法将名单 [%s] 写入文件 [%s]: %v", name, filePath, err)
+		} else {
+			log.Printf("[Updater] 名单 [%s] 已成功保存到文件: %s", name, filePath)
+		}
+	}
 	
-	u.ipFilterManager.UpdateDynamicList(name, newIPs)
+	u.ipFilterManager.UpdateDynamicList(name, newIPs, updateTime)
 	log.Printf("[Updater] 名单 [%s] 已成功更新，包含 %d 个IP/CIDR。", name, len(newIPs))
 	return nil
 }
 
-// fetchIPsFromURL 从给定的URL下载并解析IP地址列表
 func fetchIPsFromURL(url string) ([]string, error) {
 	resp, err := http.Get(url)
 	if err != nil {
