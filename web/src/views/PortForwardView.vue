@@ -1,12 +1,16 @@
 <script setup>
-import { ref, onMounted, onUnmounted, computed } from 'vue';
+import { ref, onMounted, onUnmounted, computed, nextTick, watch } from 'vue';
 import IconEdit from '../components/icons/IconEdit.vue';
 import IconDelete from '../components/icons/IconDelete.vue';
 import IconLink from '../components/icons/IconLink.vue';
 import IconLogs from '../components/icons/IconLogs.vue';
 
 const rules = ref([]);
-const ipLists = ref({});
+const ipLists = ref({
+  whitelists: {},
+  blacklists: {},
+  ip_sets: {},
+});
 const connections = ref([]);
 const recentLogsByRule = ref({});
 
@@ -16,11 +20,18 @@ const isConnModalOpen = ref(false);
 const isLogModalOpen = ref(false);
 const isAddIpModalOpen = ref(false);
 
-// --- Tooltip States ---
+// --- Tooltip States & Logic ---
+const tooltipRef = ref(null);
 const isTooltipVisible = ref(false);
-const tooltipContent = ref('');
+const tooltipContent = ref([]);
 const tooltipTop = ref(0);
 const tooltipLeft = ref(0);
+const tooltipCurrentPage = ref(1);
+const tooltipPageSize = ref(20);
+const tooltipTotalPages = ref(1);
+const tooltipJumpToPage = ref(1);
+const tooltipRuleName = ref('');
+let hideTooltipTimeout = null;
 
 // --- Modal Content States ---
 const modalMode = ref('add');
@@ -28,34 +39,46 @@ const uiState = ref({
   protocolType: 'tcp',
   ipVersion: 'any',
 });
-const currentRule = ref({
-  Name: '', Protocol: 'tcp', ListenAddr: '', ListenPort: null,
-  ForwardAddr: '', ForwardPort: null,
-  AccessControl: { Mode: 'disabled', ListName: '' }, Enabled: true,
-});
+const currentRule = ref({});
 const originalRuleName = ref('');
 const connectionsForModal = ref([]);
 const ruleForModal = ref('');
-const logsForModal = ref('');
+
+// --- Log Modal Pagination ---
+const logsForModal = ref([]);
 const ruleForLogModal = ref('');
 const isLoadingLogs = ref(false);
+const logModalCurrentPage = ref(1);
+const logModalPageSize = ref(50);
+const logModalTotalPages = ref(1);
+const logModalJumpToPage = ref(1);
 
 // --- Add IP to List Modal State ---
 const ipToAdd = ref('');
-const listTypeToAdd = ref('');
+const selectedCategory = ref('whitelists');
 const selectedIpList = ref('');
 
 let socket = null;
 
-const connectionsCount = computed(() => {
-  const counts = {};
-  if (rules.value) {
-    for (const rule of rules.value) {
-      counts[rule.Name] = connections.value.filter(c => c.Rule === rule.Name).length;
+const availableWhitelists = computed(() => ({ ...ipLists.value.whitelists, ...ipLists.value.ip_sets }));
+const availableBlacklists = computed(() => ({ ...ipLists.value.blacklists, ...ipLists.value.ip_sets }));
+const availableListsForCategory = computed(() => {
+    if (!selectedCategory.value || !ipLists.value[selectedCategory.value]) {
+        return {};
     }
-  }
-  return counts;
+    return ipLists.value[selectedCategory.value];
 });
+
+const connectionsCount = computed(() => {
+    const counts = {};
+    if (rules.value) {
+        for (const rule of rules.value) {
+            counts[rule.Name] = connections.value.filter(c => c.rule === rule.Name).length;
+        }
+    }
+    return counts;
+});
+
 
 const getApiUrl = (endpoint) => `http://${window.location.hostname}:8080${endpoint}`;
 
@@ -72,7 +95,7 @@ const connectWebSocket = () => {
         recentLogsByRule.value = payload.recentLogsByRule;
       }
       if (isConnModalOpen.value) {
-        connectionsForModal.value = payload.connections.filter(c => c.Rule === ruleForModal.value);
+        connectionsForModal.value = payload.connections.filter(c => c.rule === ruleForModal.value);
       }
     } catch (e) { console.error("解析WebSocket数据失败:", e); }
   };
@@ -89,14 +112,108 @@ const fetchRules = async () => {
 const fetchIPLists = async () => {
   try {
     const response = await fetch(getApiUrl('/api/ip-lists'));
-    if (response.ok) { ipLists.value = await response.json() || {}; }
+    if (response.ok) {
+      const data = await response.json();
+      ipLists.value = {
+        whitelists: data.whitelists || {},
+        blacklists: data.blacklists || {},
+        ip_sets: data.ip_sets || {},
+      };
+    }
   } catch (error) { console.error('加载IP名单失败:', error); }
 };
 
-const triggerRestart = async () => {
-  try { await fetch(getApiUrl('/api/actions/restart'), { method: 'POST' }); }
-  catch (error) { console.error('重启请求发送失败:', error); }
+const fetchPaginatedLogs = async (ruleName, page, pageSize) => {
+    const response = await fetch(getApiUrl(`/api/logs?rule=${ruleName}&page=${page}&pageSize=${pageSize}`));
+    if (!response.ok) throw new Error('Failed to fetch logs');
+    return await response.json();
+}
+
+const showLogTooltip = async (event, rule) => {
+    clearTimeout(hideTooltipTimeout);
+    isTooltipVisible.value = true;
+    tooltipRuleName.value = rule.Name;
+    tooltipCurrentPage.value = 1;
+    await loadTooltipLogs();
+
+    await nextTick();
+    
+    if (!tooltipRef.value) return;
+
+    const rect = event.target.getBoundingClientRect();
+    const tooltipHeight = tooltipRef.value.offsetHeight;
+    const tooltipWidth = tooltipRef.value.offsetWidth;
+    const spaceBelow = window.innerHeight - rect.bottom;
+    const spaceRight = window.innerWidth - rect.left;
+
+    tooltipTop.value = (spaceBelow < tooltipHeight + 10) ? rect.top - tooltipHeight - 10 : rect.bottom + 10;
+    tooltipLeft.value = (spaceRight < tooltipWidth) ? rect.right - tooltipWidth : rect.left;
 };
+
+const loadTooltipLogs = async () => {
+    tooltipContent.value = ["加载中..."];
+    try {
+        const data = await fetchPaginatedLogs(tooltipRuleName.value, tooltipCurrentPage.value, tooltipPageSize.value);
+        tooltipContent.value = data.logs.length > 0 ? data.logs : ['暂无日志记录'];
+        tooltipTotalPages.value = data.totalPages;
+        tooltipJumpToPage.value = tooltipCurrentPage.value;
+    } catch (e) {
+        tooltipContent.value = ['日志加载失败'];
+    }
+}
+
+const handleTooltipJump = () => {
+    const page = parseInt(tooltipJumpToPage.value, 10);
+    if (!isNaN(page) && page > 0 && page <= tooltipTotalPages.value) {
+        tooltipCurrentPage.value = page;
+        loadTooltipLogs();
+    } else {
+        tooltipJumpToPage.value = tooltipCurrentPage.value;
+    }
+}
+
+const hideLogTooltip = () => {
+    hideTooltipTimeout = setTimeout(() => {
+        isTooltipVisible.value = false;
+    }, 200);
+};
+
+const cancelTooltipHide = () => {
+    clearTimeout(hideTooltipTimeout);
+}
+
+const openLogModal = async (rule) => {
+  ruleForLogModal.value = rule.Name;
+  isLogModalOpen.value = true;
+  logModalCurrentPage.value = 1;
+  await loadModalLogs();
+};
+
+const loadModalLogs = async () => {
+    isLoadingLogs.value = true;
+    logsForModal.value = ['正在加载日志...'];
+    try {
+        const data = await fetchPaginatedLogs(ruleForLogModal.value, logModalCurrentPage.value, logModalPageSize.value);
+        logsForModal.value = data.logs.length > 0 ? data.logs : ['该规则下暂无日志记录。'];
+        logModalTotalPages.value = data.totalPages;
+        logModalJumpToPage.value = logModalCurrentPage.value;
+    } catch (error) {
+        logsForModal.value = ['加载失败，无法连接到API。'];
+    } finally {
+        isLoadingLogs.value = false;
+    }
+};
+
+const handleModalJump = () => {
+    const page = parseInt(logModalJumpToPage.value, 10);
+    if (!isNaN(page) && page > 0 && page <= logModalTotalPages.value) {
+        logModalCurrentPage.value = page;
+        loadModalLogs();
+    } else {
+        alert(`请输入一个介于 1 和 ${logModalTotalPages.value} 之间的有效页码。`);
+        logModalJumpToPage.value = logModalCurrentPage.value;
+    }
+}
 
 const toggleRule = async (rule) => {
   try {
@@ -104,10 +221,6 @@ const toggleRule = async (rule) => {
     const result = await response.json();
     if (response.ok) {
       rule.Enabled = result.enabled;
-      if (confirm(`规则 '${rule.Name}' 状态已切换。\n是否立即重启服务以应用更改？`)) {
-        triggerRestart();
-        alert('重启命令已发送。请稍后刷新页面。');
-      }
     } else {
       alert(`切换失败: ${result.error}`);
     }
@@ -123,10 +236,6 @@ const deleteRule = async (ruleName) => {
     const result = await response.json();
     if (response.ok) {
       fetchRules();
-      if (confirm(result.message + '\n是否立即重启服务以应用更改？')) {
-        triggerRestart();
-        alert('重启命令已发送。请稍后刷新页面。');
-      }
     } else { alert(`删除失败: ${result.error}`); }
   } catch (error) { alert('删除请求失败'); }
 };
@@ -160,13 +269,18 @@ const handleSubmit = async () => {
     'ipv4': '0.0.0.0',
     'ipv6': '::'
   };
-
+  
   const finalRule = {
     ...currentRule.value,
-    ListenPort: parseInt(currentRule.value.ListenPort, 10),
-    ForwardPort: parseInt(currentRule.value.ForwardPort, 10),
+    ListenPort: parseInt(currentRule.value.ListenPort, 10) || 0,
+    ForwardPort: parseInt(currentRule.value.ForwardPort, 10) || 0,
     Protocol: buildProtocolString(),
-    ListenAddr: listenAddrMap[uiState.value.ipVersion]
+    ListenAddr: listenAddrMap[uiState.value.ipVersion],
+    RateLimit: parseInt(currentRule.value.RateLimit, 10) || 0,
+    ConnectionLimit: parseInt(currentRule.value.ConnectionLimit, 10) || 0,
+    UDPSessionTimeout: parseInt(currentRule.value.UDPSessionTimeout, 10) || 0,
+    UDPMaxSessions: parseInt(currentRule.value.UDPMaxSessions, 10) || 0,
+    UDPMaxBlockLength: parseInt(currentRule.value.UDPMaxBlockLength, 10) || 0,
   };
 
   const url = modalMode.value === 'add' ? getApiUrl('/api/rules') : getApiUrl(`/api/rules/${originalRuleName.value}`);
@@ -178,10 +292,6 @@ const handleSubmit = async () => {
     if (response.ok) {
       isRuleModalOpen.value = false;
       fetchRules();
-      if (confirm(`规则已成功 ${modalMode.value === 'add' ? '添加' : '更新'}！\n是否立即重启服务以应用更改？`)) {
-        triggerRestart();
-        alert('重启命令已发送。请稍后刷新页面。');
-      }
     } else { alert(`操作失败: ${result.error}`); }
   } catch (error) { alert('请求失败'); }
 };
@@ -194,9 +304,9 @@ const disconnectConnection = async (connId) => {
   } catch (error) { alert('请求失败'); }
 };
 
-const openAddIpModal = (ip, listType) => {
+const openAddIpModal = (ip) => {
   ipToAdd.value = ip.split(':')[0];
-  listTypeToAdd.value = listType;
+  selectedCategory.value = 'whitelists';
   selectedIpList.value = '';
   isAddIpModalOpen.value = true;
 };
@@ -207,20 +317,26 @@ const confirmAddIpToList = async () => {
     return;
   }
   try {
-    const response = await fetch(getApiUrl(`/api/ip-lists/${selectedIpList.value}/add`), {
+    const response = await fetch(getApiUrl(`/api/ip-lists/add`), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ip: ipToAdd.value })
+      body: JSON.stringify({
+        category: selectedCategory.value,
+        listName: selectedIpList.value,
+        ip: ipToAdd.value
+      })
     });
     const result = await response.json();
     alert(result.message || result.error);
     if (response.ok) {
       isAddIpModalOpen.value = false;
+      fetchIPLists(); // Refresh the lists data
     }
   } catch (error) {
     alert('请求失败');
   }
 };
+
 
 const openAddModal = () => {
   modalMode.value = 'add';
@@ -228,6 +344,11 @@ const openAddModal = () => {
     Name: '', Protocol: 'tcp', ListenAddr: '', ListenPort: null,
     ForwardAddr: '', ForwardPort: null,
     AccessControl: { Mode: 'disabled', ListName: '' }, Enabled: true,
+    RateLimit: 0,
+    ConnectionLimit: 256,
+    UDPSessionTimeout: 30000,
+    UDPMaxSessions: 32,
+    UDPMaxBlockLength: 1500,
   };
   uiState.value = { protocolType: 'tcp', ipVersion: 'any' };
   isRuleModalOpen.value = true;
@@ -235,7 +356,13 @@ const openAddModal = () => {
 
 const openEditModal = (rule) => {
   modalMode.value = 'edit';
-  currentRule.value = JSON.parse(JSON.stringify(rule));
+  currentRule.value = Object.assign({
+    RateLimit: 0,
+    ConnectionLimit: 256,
+    UDPSessionTimeout: 30000,
+    UDPMaxSessions: 32,
+    UDPMaxBlockLength: 1500,
+  }, JSON.parse(JSON.stringify(rule)));
   
   let proto = rule.Protocol;
   let version = 'any';
@@ -271,44 +398,14 @@ const openEditModal = (rule) => {
 
 const openConnectionsModal = (rule) => {
   ruleForModal.value = rule.Name;
-  connectionsForModal.value = connections.value.filter(c => c.Rule === rule.Name);
+  connectionsForModal.value = connections.value.filter(c => c.rule === rule.Name);
   isConnModalOpen.value = true;
 };
 
-const openLogModal = async (rule) => {
-  ruleForLogModal.value = rule.Name;
-  isLogModalOpen.value = true;
-  isLoadingLogs.value = true;
-  logsForModal.value = '正在加载完整的日志...';
-  try {
-    const response = await fetch(getApiUrl(`/api/logs?rule=${rule.Name}`));
-    if (response.ok) {
-      const logs = await response.text();
-      logsForModal.value = logs ? logs.split('\n').reverse().join('\n') : '该规则下暂无日志记录。';
-    } else {
-      logsForModal.value = `加载日志失败: ${response.statusText}`;
-    }
-  } catch (error) {
-    logsForModal.value = '加载失败，无法连接到API。';
-  } finally {
-    isLoadingLogs.value = false;
-  }
-};
+watch(selectedCategory, () => {
+    selectedIpList.value = '';
+});
 
-const showLogTooltip = (event, rule) => {
-  const logs = recentLogsByRule.value[rule.Name];
-  if (logs && logs.length > 0) {
-    tooltipContent.value = logs.slice(-5).reverse().join('\n');
-    isTooltipVisible.value = true;
-    const rect = event.target.getBoundingClientRect();
-    tooltipTop.value = rect.bottom + 10;
-    tooltipLeft.value = rect.left;
-  }
-};
-
-const hideLogTooltip = () => {
-  isTooltipVisible.value = false;
-};
 
 onMounted(() => {
   connectWebSocket();
@@ -356,9 +453,9 @@ onUnmounted(() => {
             </div>
             <div 
               class="status-item logs" 
-              @click="openLogModal(rule)" 
               @mouseenter="showLogTooltip($event, rule)" 
               @mouseleave="hideLogTooltip"
+              @click="openLogModal(rule)"
             >
               <IconLogs /> 查看日志
             </div>
@@ -368,50 +465,94 @@ onUnmounted(() => {
     </div>
 
     <div v-if="isRuleModalOpen" class="modal-overlay" @click.self="isRuleModalOpen = false">
-      <div class="modal-content">
+      <div class="modal-content large">
         <h2>{{ modalMode === 'add' ? '添加新规则' : '编辑规则' }}</h2>
         <form @submit.prevent="handleSubmit">
-          <div class="form-group"><label for="name">规则名称 (唯一)</label><input id="name" v-model="currentRule.Name" type="text" required placeholder="例如 my-web-proxy"></div>
-          
-          <div class="form-row">
-            <div class="form-group">
-              <label for="protocol">协议类型</label>
-              <select id="protocol" v-model="uiState.protocolType">
-                  <option value="tcp">TCP</option>
-                  <option value="udp">UDP</option>
-                  <option value="tcp,udp">TCP & UDP</option>
-              </select>
+          <div class="form-section">
+            <h4>基础配置</h4>
+            <div class="form-group"><label for="name">规则名称 (唯一)</label><input id="name" v-model="currentRule.Name" type="text" required placeholder="例如 my-web-proxy"></div>
+            <div class="form-row">
+              <div class="form-group">
+                <label for="protocol">协议类型</label>
+                <select id="protocol" v-model="uiState.protocolType">
+                    <option value="tcp">TCP</option>
+                    <option value="udp">UDP</option>
+                    <option value="tcp,udp">TCP & UDP</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label for="listen-version">监听 IP 版本</label>
+                <select id="listen-version" v-model="uiState.ipVersion">
+                    <option value="any">任意 (Any)</option>
+                    <option value="ipv4">仅 IPv4</option>
+                    <option value="ipv6">仅 IPv6</option>
+                </select>
+              </div>
             </div>
-            <div class="form-group">
-              <label for="listen-version">监听 IP 版本</label>
-              <select id="listen-version" v-model="uiState.ipVersion">
-                  <option value="any">任意 (Any)</option>
-                  <option value="ipv4">仅 IPv4</option>
-                  <option value="ipv6">仅 IPv6</option>
-              </select>
+            <div class="form-row">
+                <div class="form-group"><label for="listen-port">监听端口</label><input id="listen-port" v-model.number="currentRule.ListenPort" type="number" required placeholder="例如 8080"></div>
+                <div class="form-group"><label for="forward-port">目标端口</label><input id="forward-port" v-model.number="currentRule.ForwardPort" type="number" required placeholder="例如 80"></div>
+            </div>
+            <div class="form-group"><label for="forward-addr">目标地址</label><input id="forward-addr" v-model="currentRule.ForwardAddr" type="text" required placeholder="例如 192.168.1.100 或 google.com"></div>
+          </div>
+
+          <div class="form-section">
+            <h4>访问控制</h4>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>访问控制模式</label>
+                    <select v-model="currentRule.AccessControl.Mode">
+                    <option value="disabled">不启用</option>
+                    <option value="whitelist">白名单</option>
+                    <option value="blacklist">黑名单</option>
+                    </select>
+                </div>
+                <div class="form-group" v-if="currentRule.AccessControl.Mode !== 'disabled'">
+                    <label>选择IP名单</label>
+                    <select v-if="currentRule.AccessControl.Mode === 'whitelist'" v-model="currentRule.AccessControl.ListName" required>
+                    <option disabled value="">选择白名单或IP集</option>
+                    <option v-for="(ips, name) in availableWhitelists" :key="name" :value="name">{{ name }}</option>
+                    </select>
+                     <select v-if="currentRule.AccessControl.Mode === 'blacklist'" v-model="currentRule.AccessControl.ListName" required>
+                    <option disabled value="">选择黑名单或IP集</option>
+                    <option v-for="(ips, name) in availableBlacklists" :key="name" :value="name">{{ name }}</option>
+                    </select>
+                </div>
+            </div>
+          </div>
+          
+          <div class="form-section" v-if="uiState.protocolType.includes('tcp')">
+            <h4>TCP 设置</h4>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="rate-limit">端口限速 (KB/s)</label>
+                    <input id="rate-limit" v-model.number="currentRule.RateLimit" type="number" placeholder="0 表示不限速">
+                </div>
+                <div class="form-group">
+                    <label for="conn-limit">单端口连接数限制</label>
+                    <input id="conn-limit" v-model.number="currentRule.ConnectionLimit" type="number" placeholder="默认 256">
+                </div>
             </div>
           </div>
 
-          <div class="form-group"><label for="listen-port">监听端口</label><input id="listen-port" v-model.number="currentRule.ListenPort" type="number" required placeholder="例如 8080"></div>
-          <div class="form-group"><label for="forward-addr">目标地址</label><input id="forward-addr" v-model="currentRule.ForwardAddr" type="text" required placeholder="例如 192.168.1.100 或 google.com"></div>
-          <div class="form-group"><label for="forward-port">目标端口</label><input id="forward-port" v-model.number="currentRule.ForwardPort" type="number" required placeholder="例如 80"></div>
-          
-          <hr class="form-divider">
-          <div class="form-group">
-            <label>访问控制模式</label>
-            <select v-model="currentRule.AccessControl.Mode">
-              <option value="disabled">不启用</option>
-              <option value="whitelist">白名单</option>
-              <option value="blacklist">黑名单</option>
-            </select>
+          <div class="form-section" v-if="uiState.protocolType.includes('udp')">
+            <h4>UDP 设置</h4>
+            <div class="form-row">
+                <div class="form-group">
+                    <label for="udp-timeout">会话超时 (毫秒)</label>
+                    <input id="udp-timeout" v-model.number="currentRule.UDPSessionTimeout" type="number" placeholder="默认 30000">
+                </div>
+                <div class="form-group">
+                    <label for="udp-sessions">最大会话数</label>
+                    <input id="udp-sessions" v-model.number="currentRule.UDPMaxSessions" type="number" placeholder="默认 32">
+                </div>
+            </div>
+            <div class="form-group">
+                <label for="udp-block">最大块长度 (字节)</label>
+                <input id="udp-block" v-model.number="currentRule.UDPMaxBlockLength" type="number" placeholder="默认 1500">
+            </div>
           </div>
-          <div class="form-group" v-if="currentRule.AccessControl.Mode !== 'disabled'">
-            <label>选择IP名单</label>
-            <select v-model="currentRule.AccessControl.ListName" required>
-              <option disabled value="">请选择一个IP名单</option>
-              <option v-for="(ips, name) in ipLists" :key="name" :value="name">{{ name }}</option>
-            </select>
-          </div>
+
           <div class="form-actions"><button type="button" class="btn-cancel" @click="isRuleModalOpen = false">取消</button><button type="submit" class="btn-save">保存规则</button></div>
         </form>
       </div>
@@ -430,16 +571,15 @@ onUnmounted(() => {
             </tr>
           </thead>
           <tbody>
-            <tr v-for="conn in connectionsForModal" :key="conn.ID">
-              <td>{{ conn.ClientAddr }}</td>
-              <td>{{ conn.TargetAddr }}</td>
+            <tr v-for="conn in connectionsForModal" :key="conn.id">
+              <td>{{ conn.clientAddr }}</td>
+              <td>{{ conn.targetAddr }}</td>
               <td class="conn-actions">
-                <button @click="disconnectConnection(conn.ID)" class="btn-disconnect" title="断开此连接">断开</button>
+                <button @click="disconnectConnection(conn.id)" class="btn-disconnect" title="断开此连接">断开</button>
                 <div class="dropdown">
                   <button class="btn-add-list">加入名单</button>
                   <div class="dropdown-content">
-                    <a @click="openAddIpModal(conn.ClientAddr, '白名单')">加入白名单...</a>
-                    <a @click="openAddIpModal(conn.ClientAddr, '黑名单')">加入黑名单...</a>
+                    <a @click="openAddIpModal(conn.clientAddr)">加入IP名单...</a>
                   </div>
                 </div>
               </td>
@@ -453,34 +593,76 @@ onUnmounted(() => {
       <div class="modal-content large">
         <h2>日志: {{ ruleForLogModal }}</h2>
         <div v-if="isLoadingLogs" class="empty-state-small">加载中...</div>
-        <pre v-else class="logs-container">{{ logsForModal }}</pre>
+        <pre v-else class="logs-container-modal">{{ logsForModal.join('\n') }}</pre>
+        <div class="pagination-controls">
+           <select v-model="logModalPageSize" @change="loadModalLogs">
+                <option :value="20">20/页</option>
+                <option :value="50">50/页</option>
+                <option :value="100">100/页</option>
+            </select>
+            <button @click="logModalCurrentPage > 1 && (logModalCurrentPage--, loadModalLogs())" :disabled="logModalCurrentPage <= 1">上一页</button>
+            <div class="page-jump">
+                第
+                <input type="number" v-model.number="logModalJumpToPage" @keyup.enter="handleModalJump" min="1" :max="logModalTotalPages">
+                / {{ logModalTotalPages }} 页
+            </div>
+            <button @click="logModalCurrentPage < logModalTotalPages && (logModalCurrentPage++, loadModalLogs())" :disabled="logModalCurrentPage >= logModalTotalPages">下一页</button>
+        </div>
       </div>
     </div>
     
-    <div v-if="isTooltipVisible" class="tooltip" :style="{ top: tooltipTop + 'px', left: tooltipLeft + 'px' }">
-      <pre>{{ tooltipContent }}</pre>
+    <div 
+      v-if="isTooltipVisible" 
+      ref="tooltipRef" 
+      class="tooltip" 
+      :style="{ top: tooltipTop + 'px', left: tooltipLeft + 'px' }"
+      @mouseenter="cancelTooltipHide"
+      @mouseleave="hideLogTooltip">
+      <pre>{{ tooltipContent.join('\n') }}</pre>
+       <div class="pagination-controls tooltip-pagination">
+            <select v-model="tooltipPageSize" @change="loadTooltipLogs">
+                <option :value="10">10/页</option>
+                <option :value="20">20/页</option>
+                <option :value="50">50/页</option>
+            </select>
+            <button @click="tooltipCurrentPage > 1 && (tooltipCurrentPage--, loadTooltipLogs())" :disabled="tooltipCurrentPage <= 1">‹</button>
+            <div class="page-jump-tooltip">
+                <input type="number" v-model.number="tooltipJumpToPage" @keyup.enter="handleTooltipJump" min="1" :max="tooltipTotalPages">
+                <span>/{{ tooltipTotalPages }}</span>
+            </div>
+            <button @click="tooltipCurrentPage < tooltipTotalPages && (tooltipCurrentPage++, loadTooltipLogs())" :disabled="tooltipCurrentPage >= tooltipTotalPages">›</button>
+        </div>
     </div>
 
-    <div v-if="isAddIpModalOpen" class="modal-overlay" @click.self="isAddIpModalOpen = false">
-      <div class="modal-content">
-        <h2>添加到 {{ listTypeToAdd }}</h2>
-        <p>将 IP <strong>{{ ipToAdd }}</strong> 添加到以下哪个名单？</p>
-        <div class="form-group">
-          <label for="ip-list-select">选择一个IP名单</label>
-          <select id="ip-list-select" v-model="selectedIpList">
-            <option disabled value="">请选择...</option>
-            <option v-for="(ips, name) in ipLists" :key="name" :value="name">
-              {{ name }}
-            </option>
-          </select>
+     <div v-if="isAddIpModalOpen" class="modal-overlay" @click.self="isAddIpModalOpen = false">
+        <div class="modal-content">
+            <h2>添加到IP名单</h2>
+            <p>将 IP <strong>{{ ipToAdd }}</strong> 添加到...</p>
+            <div class="form-row">
+                <div class="form-group">
+                <label for="ip-list-category-select">名单分类</label>
+                <select id="ip-list-category-select" v-model="selectedCategory">
+                    <option value="whitelists">IP白名单</option>
+                    <option value="blacklists">IP黑名单</option>
+                    <option value="ip_sets">IP集 (通用)</option>
+                </select>
+                </div>
+                <div class="form-group">
+                <label for="ip-list-select">选择一个IP名单</label>
+                <select id="ip-list-select" v-model="selectedIpList" :disabled="!selectedCategory">
+                    <option disabled value="">请选择...</option>
+                    <option v-for="(ips, name) in availableListsForCategory" :key="name" :value="name">
+                    {{ name }}
+                    </option>
+                </select>
+                </div>
+            </div>
+            <div class="form-actions">
+            <button type="button" class="btn-cancel" @click="isAddIpModalOpen = false">取消</button>
+            <button type="button" class="btn-save" @click="confirmAddIpToList">确认添加</button>
+            </div>
         </div>
-        <div class="form-actions">
-          <button type="button" class="btn-cancel" @click="isAddIpModalOpen = false">取消</button>
-          <button type="button" class="btn-save" @click="confirmAddIpToList">确认添加</button>
-        </div>
-      </div>
     </div>
-
   </div>
 </template>
 
@@ -507,17 +689,16 @@ onUnmounted(() => {
 .status-item .count { font-weight: bold; background-color: #e7f3ff; padding: 2px 6px; border-radius: 5px; }
 .status-item svg { vertical-align: middle; }
 .modal-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(0, 0, 0, 0.6); display: flex; justify-content: center; align-items: flex-start; padding: 5vh 1rem; z-index: 1000; overflow-y: auto; box-sizing: border-box; }
-.modal-content { background-color: white; padding: 2rem; border-radius: 8px; width: 100%; max-width: 500px; box-shadow: 0 5px 15px rgba(0,0,0,0.3); margin-bottom: 5vh; }
+.modal-content { background-color: white; padding: 2rem; border-radius: 8px; width: 100%; max-width: 600px; box-shadow: 0 5px 15px rgba(0,0,0,0.3); margin-bottom: 5vh; }
 .modal-content.large { max-width: 800px; }
 .modal-content h2 { margin-top: 0; margin-bottom: 1.5rem; }
-.form-group { margin-bottom: 1rem; }
+.form-group { margin-bottom: 1rem; flex: 1; }
 .form-group label { display: block; margin-bottom: 0.5rem; font-weight: 500; }
 .form-group input, .form-group select { width: 100%; padding: 0.7rem; border: 1px solid #e0e0e0; border-radius: 5px; font-size: 1rem; box-sizing: border-box; }
 .form-actions { margin-top: 2rem; display: flex; justify-content: flex-end; gap: 1rem; }
 .form-actions button { padding: 0.7rem 1.5rem; border-radius: 5px; border: none; cursor: pointer; font-size: 1rem; font-weight: 500; }
 .btn-cancel { background-color: #e0e0e0; color: #333; }
 .btn-save { background-color: #007bff; color: white; }
-.form-divider { border: none; border-top: 1px solid #eee; margin: 1.5rem 0; }
 .empty-state-small { text-align: center; padding: 1rem; color: #999; }
 table { width: 100%; border-collapse: collapse; }
 th, td { padding: 0.8rem 1rem; text-align: left; border-bottom: 1px solid #e0e0e0; font-size: 0.9rem; }
@@ -542,19 +723,21 @@ input:checked + .slider:before { transform: translateX(18px); }
 .slider.round { border-radius: 22px; }
 .slider.round:before { border-radius: 50%; }
 .form-row { display: flex; gap: 1rem; }
-.form-row .form-group { flex: 1; }
+.form-section { border: 1px solid #f0f0f0; border-radius: 8px; padding: 1rem 1.5rem; margin-bottom: 1.5rem; }
+.form-section h4 { margin-top: 0; margin-bottom: 1rem; border-bottom: 1px solid #eee; padding-bottom: 0.75rem; font-size: 1.1rem; color: #333; }
 
-.logs-container {
+.logs-container-modal {
   background-color: #282c34;
   color: #dcdfe4;
   border-radius: 5px;
-  height: 60vh;
+  height: 50vh;
   overflow-y: auto;
   white-space: pre-wrap;
   word-break: break-all;
   font-family: "SFMono-Regular", Consolas, Menlo, monospace;
   font-size: 0.85rem;
   padding: 1rem;
+  margin-bottom: 1rem;
 }
 
 .tooltip {
@@ -569,8 +752,90 @@ input:checked + .slider:before { transform: translateX(18px); }
   white-space: pre;
   z-index: 2000;
   max-width: 800px;
-  max-height: 200px;
   overflow: hidden;
-  pointer-events: none;
+  pointer-events: auto;
+  display: flex;
+  flex-direction: column;
+  transition: opacity 0.2s;
+}
+
+.tooltip pre {
+  margin: 0;
+  padding: 0;
+  flex-grow: 1;
+  max-height: 250px;
+  overflow-y: auto;
+}
+
+.pagination-controls {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 10px;
+    padding-top: 10px;
+    margin-top: auto;
+    border-top: 1px solid #555;
+    font-size: 0.8rem;
+}
+.pagination-controls button, .pagination-controls select {
+    background-color: #4a5568;
+    color: white;
+    border: 1px solid #718096;
+    border-radius: 4px;
+    padding: 2px 8px;
+    cursor: pointer;
+}
+.pagination-controls button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+.tooltip-pagination {
+    font-size: 0.7rem;
+    padding-top: 5px;
+    margin-top: 5px;
+    gap: 5px;
+}
+.tooltip-pagination button, .tooltip-pagination select {
+    padding: 1px 5px;
+}
+.modal-content .pagination-controls {
+    border-top: 1px solid #e0e0e0;
+}
+.modal-content .pagination-controls button, .modal-content .pagination-controls select {
+    background-color: #f8f9fa;
+    color: #333;
+    border: 1px solid #ccc;
+}
+.page-jump, .page-jump-tooltip {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+}
+.page-jump input, .page-jump-tooltip input {
+    width: 40px;
+    text-align: center;
+    padding: 2px;
+    border-radius: 3px;
+    border: 1px solid #718096;
+    background-color: #2d3748;
+    color: white;
+}
+.modal-content .page-jump input {
+    width: 50px;
+    padding: 0.5rem;
+    border: 1px solid #ccc;
+    background-color: white;
+    color: black;
+}
+.page-jump input::-webkit-outer-spin-button,
+.page-jump input::-webkit-inner-spin-button,
+.page-jump-tooltip input::-webkit-outer-spin-button,
+.page-jump-tooltip input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+.page-jump input[type=number],
+.page-jump-tooltip input[type=number] {
+  -moz-appearance: textfield;
 }
 </style>
