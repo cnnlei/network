@@ -12,14 +12,26 @@ const ipLists = ref({
   whitelists: {},
   blacklists: {},
   ip_sets: {},
+  country_ip_lists: {},
+  url_ip_sets: {},
 });
 
 const availableWhitelists = computed(() => {
-  return { ...ipLists.value.whitelists, ...ipLists.value.ip_sets };
+  const lists = [];
+  for (const name in ipLists.value.whitelists) lists.push({ name, source: 'IP白名单' });
+  for (const name in ipLists.value.ip_sets) lists.push({ name, source: 'IP集' });
+  for (const name in ipLists.value.country_ip_lists) lists.push({ name, source: '国家IP' });
+  for (const name in ipLists.value.url_ip_sets) lists.push({ name, source: 'URL IP集' });
+  return lists;
 });
 
 const availableBlacklists = computed(() => {
-  return { ...ipLists.value.blacklists, ...ipLists.value.ip_sets };
+  const lists = [];
+  for (const name in ipLists.value.blacklists) lists.push({ name, source: 'IP黑名单' });
+  for (const name in ipLists.value.ip_sets) lists.push({ name, source: 'IP集' });
+  for (const name in ipLists.value.country_ip_lists) lists.push({ name, source: '国家IP' });
+  for (const name in ipLists.value.url_ip_sets) lists.push({ name, source: 'URL IP集' });
+  return lists;
 });
 
 const getApiUrl = (endpoint) => `http://${window.location.hostname}:8080${endpoint}`;
@@ -52,6 +64,8 @@ const fetchIPLists = async () => {
         whitelists: data.whitelists || {},
         blacklists: data.blacklists || {},
         ip_sets: data.ip_sets || {},
+        country_ip_lists: data.country_ip_lists || {},
+        url_ip_sets: data.url_ip_sets || {},
       };
     }
   } catch (error) {
@@ -136,8 +150,8 @@ onMounted(() => {
             <label for="whitelist-list-select">选择IP名单 (白名单或IP集)</label>
             <select id="whitelist-list-select" v-model="globalAC.WhitelistListName" required>
               <option disabled value="">请选择一个IP名单</option>
-              <option v-for="(ips, name) in availableWhitelists" :key="name" :value="name">
-                {{ name }} ({{ ips ? ips.length : 0 }} IPs)
+              <option v-for="list in availableWhitelists" :key="list.name" :value="list.name">
+                {{ list.name }} ({{ list.source }})
               </option>
             </select>
           </div>
@@ -163,8 +177,8 @@ onMounted(() => {
             <label for="blacklist-list-select">选择IP名单 (黑名单或IP集)</label>
             <select id="blacklist-list-select" v-model="globalAC.BlacklistListName" required>
               <option disabled value="">请选择一个IP名单</option>
-              <option v-for="(ips, name) in availableBlacklists" :key="name" :value="name">
-                {{ name }} ({{ ips ? ips.length : 0 }} IPs)
+              <option v-for="list in availableBlacklists" :key="list.name" :value="list.name">
+                {{ list.name }} ({{ list.source }})
               </option>
             </select>
           </div>

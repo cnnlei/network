@@ -1,42 +1,36 @@
 <script setup>
 import { ref, onMounted, computed } from 'vue';
 
-// Main data structure for all IP lists from the backend
 const ipLists = ref({
   whitelists: {},
   blacklists: {},
   ip_sets: {},
   country_ip_lists: {},
+  url_ip_sets: {},
 });
 
-// State for the UI
+const listStatuses = ref({});
 const activeTab = ref('whitelists');
 const ipListEditName = ref('');
 const ipListEditText = ref('');
-
-// State for the "Add New List" modal
 const isModalOpen = ref(false);
-const newList = ref({
-    name: '',
-    type: 'manual', 
-    source: 'CN'    
-});
+const newList = ref({ name: '', type: 'manual', source: '' });
 const isCreating = ref(false);
 
-// List of countries for the dropdown
 const countryList = ref({
     "CN": "中国", "US": "美国", "JP": "日本", "KR": "韩国", "GB": "英国", "DE": "德国", "FR": "法国", "RU": "俄罗斯", "CA": "加拿大", "AU": "澳大利亚", "IN": "印度", "BR": "巴西", "HK": "香港", "TW": "台湾"
 });
 
-// Computed property to get the lists for the currently active tab
 const currentListObject = computed(() => {
   if (!activeTab.value || !ipLists.value) return {};
+  if (activeTab.value === 'ip_sets') {
+    return { ...(ipLists.value.ip_sets || {}), ...(ipLists.value.url_ip_sets || {}) };
+  }
   return ipLists.value[activeTab.value] || {};
 });
 
 const getApiUrl = (endpoint) => `http://${window.location.hostname}:8080${endpoint}`;
 
-// Fetch all IP lists from the backend
 const fetchIPLists = async () => {
   try {
     const response = await fetch(getApiUrl('/api/ip-lists'));
@@ -46,76 +40,101 @@ const fetchIPLists = async () => {
         whitelists: data.whitelists || {},
         blacklists: data.blacklists || {},
         ip_sets: data.ip_sets || {},
-        country_ip_lists: data.country_ip_lists || {}
+        country_ip_lists: data.country_ip_lists || {},
+        url_ip_sets: data.url_ip_sets || {},
       };
     }
-  } catch (error) { console.error('加载IP名单失败:', error); }
+  } catch (error) { console.error('加载IP名单配置失败:', error); }
 };
 
-// Save all changes made in the UI back to the server
-const saveIPLists = async () => {
-  if (!confirm('确定要保存所有IP名单的修改吗？此操作会立即生效，并触发动态列表的更新。')) return;
+const fetchListStatuses = async () => {
   try {
+    const response = await fetch(getApiUrl('/api/ip-lists/status'));
+    if (response.ok) {
+      listStatuses.value = await response.json();
+    }
+  } catch (error) { console.error('加载IP名单状态失败:', error); }
+};
+
+const formatTime = (timeStr) => {
+    if (!timeStr || timeStr.startsWith("0001-01-01")) return '从未';
+    return new Date(timeStr).toLocaleString('sv-SE');
+};
+
+
+const saveIPLists = async () => {
+  if (!confirm('确定要保存所有名单的配置吗？此操作会立即生效。')) return;
+
+  // 保存手动列表的编辑
+  if (ipListEditName.value) {
+    const list = currentListObject.value[ipListEditName.value];
+    if (list && !list.Type) { // 确保是手动列表
+        const listContainer = ipLists.value[activeTab.value];
+        if (listContainer) {
+            listContainer[ipListEditName.value] = ipListEditText.value.split('\n').map(ip => ip.trim()).filter(ip => ip && !ip.startsWith('#'));
+        }
+    }
+  }
+  
+  try {
+    const payload = {
+      whitelists: ipLists.value.whitelists,
+      blacklists: ipLists.value.blacklists,
+      ip_sets: ipLists.value.ip_sets,
+      country_ip_lists: ipLists.value.country_ip_lists,
+      url_ip_sets: ipLists.value.url_ip_sets,
+    };
     const response = await fetch(getApiUrl('/api/ip-lists'), {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(ipLists.value)
+      body: JSON.stringify(payload)
     });
     if (response.ok) {
-      alert('IP名单已保存！');
+      alert('IP名单配置已保存！');
       fetchIPLists();
+      fetchListStatuses();
     } else { 
       const errorData = await response.json();
-      alert(`保存失败: ${errorData.error}`);
+      alert(`保存配置失败: ${errorData.error}`);
     }
-  } catch (error) { alert('请求失败'); }
+  } catch (error) { alert('保存配置请求失败'); }
 };
 
-// Switch between tabs (whitelists, blacklists, etc.)
 const selectTab = (tabName) => {
   activeTab.value = tabName;
   ipListEditName.value = '';
   ipListEditText.value = '';
-}
+};
 
-// Handle clicking on a list item to edit it
-const editIPList = (name, list) => {
+const editIPList = async (name, list) => {
   ipListEditName.value = name;
-  if (activeTab.value === 'country_ip_lists') {
-      const listConfig = list;
-      let typeText = listConfig.Type === 'country' ? '国家' : 'URL';
-      let sourceText = listConfig.Type === 'country' ? (countryList.value[listConfig.Source] || listConfig.Source) : listConfig.Source;
-      
-      ipListEditText.value = `# 这是一个由 [${typeText}] 自动管理的名单。\n# IP内容由后台自动更新，此处不可编辑。\n\n# 来源: ${sourceText}`;
+  const isDynamicList = list && typeof list === 'object' && !Array.isArray(list);
+
+  if (isDynamicList) {
+      let typeText = list.Type === 'country' ? '国家' : 'URL';
+      let sourceText = list.Type === 'country' ? (countryList.value[list.Source] || list.Source) : list.Source;
+      ipListEditText.value = `# 这是一个由 [${typeText}] 自动管理的名单。\n# 此处内容为只读，如需修改，请克隆为手动名单。\n\n# 来源: ${sourceText}`;
   } else {
       ipListEditText.value = (list || []).join('\n');
   }
 };
 
-// Update the local data as the user types in the textarea
 const updateIPListFromText = () => {
-  if (ipListEditName.value && activeTab.value !== 'country_ip_lists') {
-    const list = ipLists.value[activeTab.value];
-    if (list && list[ipListEditName.value] !== undefined) {
-      list[ipListEditName.value] = ipListEditText.value.split('\n').map(ip => ip.trim()).filter(ip => ip && !ip.startsWith('#'));
-    }
-  }
+  // This function is now only for live editing display, saving happens in saveIPLists
 };
 
-// Open the modal for creating a new list
 const openAddModal = () => {
-    if (activeTab.value === 'country_ip_lists') {
-        newList.value = { name: '', type: 'country', source: 'CN' };
-    } else {
-        newList.value = { name: '' };
-    }
-    isModalOpen.value = true;
+  newList.value = { name: '', type: 'manual', source: '' };
+  if (activeTab.value === 'country_ip_lists') {
+    newList.value.type = 'country';
+    newList.value.source = 'CN';
+  }
+  isModalOpen.value = true;
 };
 
-// Handle the creation of a new list from the modal
 const handleCreateList = () => {
-    if (!newList.value.name) {
-        alert('名单名称不能为空！');
+    if (!newList.value.name || (newList.value.type === 'url' && !newList.value.source)) {
+        alert('名单名称和来源不能为空！');
         return;
     }
     if (currentListObject.value[newList.value.name]) {
@@ -125,43 +144,80 @@ const handleCreateList = () => {
     const name = newList.value.name;
 
     if (activeTab.value === 'country_ip_lists') {
-        ipLists.value.country_ip_lists[name] = {
-            Type: newList.value.type,
-            Source: newList.value.source,
-            UpdateInterval: 60, // A default value
-        };
-        // After creating a dynamic list, we don't know the IPs yet, so we show a placeholder.
-        editIPList(name, ipLists.value.country_ip_lists[name]);
+        ipLists.value.country_ip_lists[name] = { Type: newList.value.type, Source: newList.value.source };
+    } else if (activeTab.value === 'ip_sets') {
+        if (newList.value.type === 'manual') {
+            ipLists.value.ip_sets[name] = [];
+        } else {
+            if (!ipLists.value.url_ip_sets) ipLists.value.url_ip_sets = {};
+            ipLists.value.url_ip_sets[name] = { Type: 'url', Source: newList.value.source };
+        }
     } else {
         ipLists.value[activeTab.value][name] = [];
-        editIPList(name, []);
     }
     isModalOpen.value = false;
 };
 
-// Delete a list from the current tab
 const deleteIPList = (name) => {
-  if (confirm(`确定要删除IP名单 "${name}" 吗？所有使用此名单的规则将不再受其保护！`)) {
-    delete currentListObject.value[name];
-    if (ipListEditName.value === name) {
-      ipListEditName.value = '';
-      ipListEditText.value = '';
-    }
+  if (!confirm(`确定要删除IP名单 "${name}" 吗？所有使用此名单的规则将不再受其保护！`)) return;
+  
+  const list = currentListObject.value[name];
+  if (list) {
+    if (list.Type === 'country') delete ipLists.value.country_ip_lists[name];
+    else if (list.Type === 'url') delete ipLists.value.url_ip_sets[name];
+    else if (ipLists.value.ip_sets[name]) delete ipLists.value.ip_sets[name];
+    else if (ipLists.value[activeTab.value]?.[name]) delete ipLists.value[activeTab.value][name];
+  }
+
+  if (ipListEditName.value === name) {
+    ipListEditName.value = '';
+    ipListEditText.value = '';
   }
 };
 
-// Manually trigger a refresh for a dynamic list
 const refreshList = async (name) => {
     try {
         const response = await fetch(getApiUrl(`/api/ip-lists/${name}/refresh`), { method: 'POST' });
         const result = await response.json();
         alert(result.message || result.error);
+        setTimeout(() => {
+          fetchListStatuses();
+        }, 1000); 
     } catch (error) {
         alert('刷新请求失败');
     }
 };
 
-onMounted(fetchIPLists);
+const cloneList = async (name) => {
+  const newName = prompt(`请输入克隆后新名单的名称（将保存在 "IP集" 中）：`, `${name}-manual`);
+  if (!newName) return;
+  if (ipLists.value.ip_sets[newName] || ipLists.value.url_ip_sets[newName]) {
+    alert("该名称在 'IP集' 中已存在！");
+    return;
+  }
+  
+  try {
+    const response = await fetch(getApiUrl(`/api/ip-lists/file/${name}`));
+    if (!response.ok) {
+        const errorData = await response.json();
+        alert(`无法克隆: ${errorData.error}`);
+        return;
+    }
+    const content = await response.text();
+    ipLists.value.ip_sets[newName] = content.split('\n').filter(Boolean);
+    alert(`成功克隆为 "${newName}"！请切换到 "IP集" 标签页查看并保存更改。`);
+    selectTab('ip_sets');
+    editIPList(newName, ipLists.value.ip_sets[newName]);
+  } catch (error) {
+    alert(`克隆失败: ${error.message}`);
+  }
+};
+
+
+onMounted(() => {
+  fetchIPLists();
+  fetchListStatuses();
+});
 </script>
 
 <template>
@@ -169,6 +225,7 @@ onMounted(fetchIPLists);
     <div class="panel-header">
       <h2>IP名单管理</h2>
       <div>
+        <button v-if="currentListObject[ipListEditName] && currentListObject[ipListEditName].Type" @click="cloneList(ipListEditName)" class="btn btn-secondary" style="margin-right: 10px;">克隆为手动名单</button>
         <button @click="openAddModal" class="btn" style="margin-right: 10px;">+ 新建名单</button>
         <button @click="saveIPLists" class="btn btn-primary">保存所有更改</button>
       </div>
@@ -190,15 +247,18 @@ onMounted(fetchIPLists);
               @click="editIPList(name, list)">
             <div class="list-item-main">
                 <span class="list-name-text">{{ name }}</span>
-                <span v-if="activeTab !== 'country_ip_lists'" class="list-name-detail">
-                    共 {{ list ? list.length : 0 }} 条规则
+                <span v-if="list.Type" class="list-name-detail">
+                  类型: {{ list.Type === 'country' ? (countryList[list.Source] || list.Source) : 'URL' }}
                 </span>
-                <span v-else class="list-name-detail">
-                    类型: {{ list.Type === 'country' ? (countryList[list.Source] || list.Source) : 'URL' }}
+                 <span v-if="listStatuses[name]" class="list-name-detail">
+                    共 {{ listStatuses[name].count }} 条 | 更新于: {{ formatTime(listStatuses[name].lastUpdated) }}
+                </span>
+                 <span v-else-if="!list.Type" class="list-name-detail">
+                    共 {{ list ? list.length : 0 }} 条规则
                 </span>
             </div>
             <div class="list-item-actions">
-              <button v-if="activeTab === 'country_ip_lists'" @click.stop="refreshList(name)" class="action-btn refresh-btn" title="刷新">刷新</button>
+              <button v-if="list.Type" @click.stop="refreshList(name)" class="action-btn refresh-btn" title="刷新">刷新</button>
               <button @click.stop="deleteIPList(name)" class="action-btn delete-btn" title="删除">×</button>
             </div>
           </li>
@@ -209,7 +269,7 @@ onMounted(fetchIPLists);
             v-if="ipListEditName" 
             v-model="ipListEditText" 
             @input="updateIPListFromText" 
-            :disabled="activeTab === 'country_ip_lists'"
+            :disabled="currentListObject[ipListEditName] && currentListObject[ipListEditName].Type"
             rows="10" 
             placeholder="请选择一个名单..."></textarea>
         <div v-else class="empty-state-small">请选择或新建一个IP名单进行编辑。</div>
@@ -246,6 +306,20 @@ onMounted(fetchIPLists);
                 </div>
               </div>
 
+              <div v-if="activeTab === 'ip_sets'">
+                <div class="form-group">
+                    <label>类型</label>
+                    <select v-model="newList.type">
+                        <option value="manual">手动输入</option>
+                        <option value="url">按网址</option>
+                    </select>
+                </div>
+                <div class="form-group" v-if="newList.type === 'url'">
+                    <label>URL地址</label>
+                    <input v-model="newList.source" type="url" placeholder="http://.../my_ips.txt">
+                </div>
+              </div>
+
               <div class="form-actions">
                   <button type="button" class="btn-cancel" @click="isModalOpen = false">取消</button>
                   <button type="submit" class="btn-save" :disabled="isCreating">{{ isCreating ? '创建中...' : '创建' }}</button>
@@ -260,50 +334,27 @@ onMounted(fetchIPLists);
 .panel-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; }
 .btn { background-color: #007bff; color: white; border: none; padding: 0.6rem 1.2rem; border-radius: 5px; cursor: pointer; font-size: 0.9rem; font-weight: 500; transition: background-color 0.2s; }
 .btn-primary { background-color: #28a745; }
+.btn-secondary { background-color: #6c757d; }
 .ip-list-panel { border-left: 4px solid #ffc107; }
 .tabs { display: flex; border-bottom: 1px solid #e0e0e0; margin-bottom: 1.5rem; }
 .tabs button { padding: 0.8rem 1.2rem; border: none; background-color: transparent; cursor: pointer; font-size: 1rem; position: relative; color: #6c757d; }
 .tabs button.active { color: #007bff; font-weight: 600; }
 .tabs button.active::after { content: ''; position: absolute; bottom: -1px; left: 0; width: 100%; height: 2px; background-color: #007bff; }
 .ip-list-manager { display: flex; gap: 1.5rem; min-height: 400px; }
-.list-names { flex-basis: 250px; flex-shrink: 0; border-right: 1px solid #e0e0e0; overflow-y: auto; padding-right: 1rem; }
+.list-names { flex-basis: 340px; flex-shrink: 0; border-right: 1px solid #e0e0e0; overflow-y: auto; padding-right: 1rem; }
 .list-names ul { list-style-type: none; margin: 0; padding: 0; }
 .list-names li { padding: 0.8rem; cursor: pointer; border-radius: 4px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem; border: 1px solid transparent; }
 .list-names li:hover { background-color: #f0f4ff; }
 .list-names li.active { background-color: #007bff; color: white; border-color: #007bff; }
-
-.list-item-main {
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-    gap: 2px;
-}
-
-.list-name-text {
-    font-weight: 500;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-
-.list-name-detail {
-    font-size: 0.75rem;
-    color: #6c757d;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-
-.list-names li.active .list-name-detail {
-    color: #e0e0e0;
-}
-
+.list-item-main { display: flex; flex-direction: column; overflow: hidden; gap: 2px; }
+.list-name-text { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.list-name-detail { font-size: 0.75rem; color: #6c757d; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.list-names li.active .list-name-detail { color: #e0e0e0; }
 .list-item-actions { display: flex; align-items: center; gap: 5px; opacity: 0; transition: opacity 0.2s; padding-left: 10px; }
 .list-names li:hover .list-item-actions { opacity: 1; }
 .action-btn { background: none; border: none; color: inherit; font-size: 0.8rem; cursor: pointer; opacity: 0.6; padding: 4px 8px; border-radius: 4px; line-height: 1; }
 .action-btn:hover { opacity: 1; background-color: rgba(0, 0, 0, 0.1); }
 .delete-list-btn { font-size: 1.2rem; }
-
 .list-editor { flex-grow: 1; display: flex; flex-direction: column; }
 .list-editor textarea { width: 100%; height: 100%; font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, Courier, monospace; resize: none; border: 1px solid #e0e0e0; border-radius: 5px; padding: 0.5rem; }
 .empty-state-small { text-align: center; padding: 1rem; color: #999; width: 100%; display: flex; align-items: center; justify-content: center; }

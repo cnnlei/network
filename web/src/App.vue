@@ -1,4 +1,3 @@
-// cnnlei/network/network-33ab537e85847c302b55c126d843f77b047a1244/web/src/App.vue
 <script setup>
 </script>
 
@@ -11,7 +10,9 @@
       <nav class="navigation">
         <router-link to="/">端口转发</router-link>
         <router-link to="/ip-lists">IP 名单</router-link>
-        <router-link to="/global-acl">全局访问控制</router-link> <router-link to="/logs">历史日志</router-link>
+        <router-link to="/global-acl">全局访问控制</router-link>
+        <router-link to="/logs">历史日志</router-link>
+        <router-link to="/settings">设置</router-link> 
       </nav>
     </aside>
     <main class="main-content">

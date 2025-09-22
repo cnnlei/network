@@ -10,6 +10,8 @@ const ipLists = ref({
   whitelists: {},
   blacklists: {},
   ip_sets: {},
+  country_ip_lists: {},
+  url_ip_sets: {},
 });
 const connections = ref([]);
 const recentLogsByRule = ref({});
@@ -60,8 +62,23 @@ const selectedIpList = ref('');
 
 let socket = null;
 
-const availableWhitelists = computed(() => ({ ...ipLists.value.whitelists, ...ipLists.value.ip_sets }));
-const availableBlacklists = computed(() => ({ ...ipLists.value.blacklists, ...ipLists.value.ip_sets }));
+const availableWhitelists = computed(() => {
+  const lists = [];
+  for (const name in ipLists.value.whitelists) lists.push({ name, source: 'IP白名单' });
+  for (const name in ipLists.value.ip_sets) lists.push({ name, source: 'IP集' });
+  for (const name in ipLists.value.country_ip_lists) lists.push({ name, source: '国家IP' });
+  for (const name in ipLists.value.url_ip_sets) lists.push({ name, source: 'URL IP集' });
+  return lists;
+});
+const availableBlacklists = computed(() => {
+  const lists = [];
+  for (const name in ipLists.value.blacklists) lists.push({ name, source: 'IP黑名单' });
+  for (const name in ipLists.value.ip_sets) lists.push({ name, source: 'IP集' });
+  for (const name in ipLists.value.country_ip_lists) lists.push({ name, source: '国家IP' });
+  for (const name in ipLists.value.url_ip_sets) lists.push({ name, source: 'URL IP集' });
+  return lists;
+});
+
 const availableListsForCategory = computed(() => {
     if (!selectedCategory.value || !ipLists.value[selectedCategory.value]) {
         return {};
@@ -118,6 +135,8 @@ const fetchIPLists = async () => {
         whitelists: data.whitelists || {},
         blacklists: data.blacklists || {},
         ip_sets: data.ip_sets || {},
+        country_ip_lists: data.country_ip_lists || {},
+        url_ip_sets: data.url_ip_sets || {},
       };
     }
   } catch (error) { console.error('加载IP名单失败:', error); }
@@ -511,11 +530,11 @@ onUnmounted(() => {
                     <label>选择IP名单</label>
                     <select v-if="currentRule.AccessControl.Mode === 'whitelist'" v-model="currentRule.AccessControl.ListName" required>
                     <option disabled value="">选择白名单或IP集</option>
-                    <option v-for="(ips, name) in availableWhitelists" :key="name" :value="name">{{ name }}</option>
+                    <option v-for="list in availableWhitelists" :key="list.name" :value="list.name">{{ list.name }} ({{ list.source }})</option>
                     </select>
                      <select v-if="currentRule.AccessControl.Mode === 'blacklist'" v-model="currentRule.AccessControl.ListName" required>
                     <option disabled value="">选择黑名单或IP集</option>
-                    <option v-for="(ips, name) in availableBlacklists" :key="name" :value="name">{{ name }}</option>
+                    <option v-for="list in availableBlacklists" :key="list.name" :value="list.name">{{ list.name }} ({{ list.source }})</option>
                     </select>
                 </div>
             </div>
