@@ -1,15 +1,21 @@
 global_access_control:
-    mode: blacklist_only
-    whitelist_enabled: false
-    whitelist_list_name: ""
+    mode: priority
+    whitelist_enabled: true
+    whitelist_list_name: 全局白名单
     blacklist_enabled: true
-    blacklist_list_name: blocked-ips
+    blacklist_list_name: 全局黑名单
 ip_lists:
-    admin-ips:
-        - 127.0.0.1
-        - 192.168.0.0/16
-    blocked-ips:
-        - 8.8.8.8
+    whitelists:
+        全局白名单:
+            - 192.168.122.250
+    blacklists:
+        全局黑名单: []
+    ip_sets: {}
+    country_ip_lists:
+        中国ip:
+            type: country
+            source: CN
+            update_interval: 60
 rules:
     - name: test-all
       protocol: tcp,udp
@@ -21,12 +27,93 @@ rules:
         mode: disabled
         list_name: admin-ips
       enabled: true
+      rate_limit: 20
     - name: test-tcp01
       protocol: udp
       listen_addr: ""
       listen_port: 53536
       forward_addr: 8.8.8.8
       forward_port: 53
+      access_control:
+        mode: disabled
+        list_name: ""
+      enabled: true
+    - name: 端口转发
+      protocol: tcp
+      listen_addr: ""
+      listen_port: 2225
+      forward_addr: 192.168.122.250
+      forward_port: 3389
+      access_control:
+        mode: disabled
+        list_name: ""
+      enabled: true
+    - name: 测试
+      protocol: tcp
+      listen_addr: ""
+      listen_port: 22226
+      forward_addr: 192.168.122.250
+      forward_port: 3389
+      access_control:
+        mode: disabled
+        list_name: ""
+      enabled: true
+    - name: 测试1
+      protocol: tcp
+      listen_addr: ""
+      listen_port: 2226
+      forward_addr: 192.168.122.250
+      forward_port: 80
+      access_control:
+        mode: disabled
+        list_name: ""
+      enabled: true
+    - name: ceshi2
+      protocol: tcp
+      listen_addr: ""
+      listen_port: 2227
+      forward_addr: 192.168.122.250
+      forward_port: 81
+      access_control:
+        mode: disabled
+        list_name: ""
+      enabled: true
+    - name: ceshi3
+      protocol: tcp
+      listen_addr: ""
+      listen_port: 2228
+      forward_addr: 192.168.122.250
+      forward_port: 9998
+      access_control:
+        mode: disabled
+        list_name: ""
+      enabled: true
+    - name: 测试4
+      protocol: tcp
+      listen_addr: ""
+      listen_port: 2229
+      forward_addr: 192.168.122.250
+      forward_port: 82
+      access_control:
+        mode: disabled
+        list_name: ""
+      enabled: true
+    - name: ceshi5
+      protocol: tcp
+      listen_addr: ""
+      listen_port: 2230
+      forward_addr: 192.168.122.250
+      forward_port: 3389
+      access_control:
+        mode: disabled
+        list_name: ""
+      enabled: true
+    - name: ceshi8
+      protocol: tcp
+      listen_addr: ""
+      listen_port: 22896
+      forward_addr: 192.168.122.250
+      forward_port: 308
       access_control:
         mode: disabled
         list_name: ""

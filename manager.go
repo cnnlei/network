@@ -15,7 +15,6 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// 修改 BroadcastPayload 结构，加入按规则分类的日志
 type BroadcastPayload struct {
 	Connections      []*ConnectionInfo   `json:"connections"`
 	RecentLogs       string              `json:"recentLogs"`
@@ -23,11 +22,11 @@ type BroadcastPayload struct {
 }
 
 type ConnectionInfo struct {
-	ID         int64     `json:"ID"`
-	Protocol   string    `json:"Protocol"`
-	Rule       string    `json:"Rule"`
-	ClientAddr string    `json:"ClientAddr"`
-	TargetAddr string    `json:"TargetAddr"`
+	ID         int64     `json:"id"`
+	Protocol   string    `json:"protocol"`
+	Rule       string    `json:"rule"`
+	ClientAddr string    `json:"clientAddr"`
+	TargetAddr string    `json:"targetAddr"`
 	StartTime  time.Time `json:"startTime"`
 	clientConn net.Conn  `json:"-"`
 	targetConn net.Conn  `json:"-"`
@@ -47,7 +46,6 @@ func NewConnectionManager() *ConnectionManager {
 	}
 }
 
-// 修改函数，使其能同时返回所有最新日志和按规则分类的日志
 func readRecentLogs(filePath string, n int) (string, map[string][]string, error) {
 	file, err := os.Open(filePath)
 	if err != nil {

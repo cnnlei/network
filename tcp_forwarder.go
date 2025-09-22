@@ -1,4 +1,3 @@
-// cnnlei/network/network-33ab537e85847c302b55c126d843f77b047a1244/tcp_forwarder.go
 package main
 
 import (
@@ -8,10 +7,11 @@ import (
 	"strings"
 )
 
+// handleTCPConnection 处理单个TCP连接的转发
+// 注意：startTCPForwarder函数已经被移到forwarder_manager.go中
 func handleTCPConnection(clientConn net.Conn, rule Rule, manager *ConnectionManager, ipFilterManager *IPFilterManager) {
 	clientIP := strings.Split(clientConn.RemoteAddr().String(), ":")[0]
 
-	// 统一调用新的检查函数
 	allowed, reason := ipFilterManager.IsAllowed(clientIP, rule.AccessControl)
 	if !allowed {
 		log.Printf("[%s] 已拒绝来自 %s 的连接: %s", rule.Name, clientIP, reason)
@@ -42,19 +42,4 @@ func handleTCPConnection(clientConn net.Conn, rule Rule, manager *ConnectionMana
 
 	go io.Copy(targetConn, clientConn)
 	io.Copy(clientConn, targetConn)
-}
-
-func startTCPForwarder(rule Rule, manager *ConnectionManager, ipFilterManager *IPFilterManager) {
-	listener, err := net.Listen(rule.Protocol, rule.ListenAddress())
-	if err != nil {
-		log.Printf("错误: 无法为规则 [%s] 监听TCP端口 %s (%s): %v", rule.Name, rule.ListenAddress(), rule.Protocol, err)
-		return
-	}
-	defer listener.Close()
-	log.Printf("==== 规则 [%s] 已启动并成功监听TCP在 %s (%s) ====", rule.Name, rule.ListenAddress(), rule.Protocol)
-	for {
-		clientConn, err := listener.Accept()
-		if err != nil { continue }
-		go handleTCPConnection(clientConn, rule, manager, ipFilterManager)
-	}
 }

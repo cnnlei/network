@@ -1,10 +1,10 @@
-// cnnlei/network/network-33ab537e85847c302b55c126d843f77b047a1244/main.go
 package main
 
 import (
 	"bufio"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -18,10 +18,19 @@ import (
 )
 
 var (
-	configMutex     = &sync.RWMutex{}
-	currentConfig   *Config
-	ipFilterManager *IPFilterManager
+	configMutex      = &sync.RWMutex{}
+	currentConfig    *Config
+	ipFilterManager  *IPFilterManager
+	forwarderManager *ForwarderManager
+	updater          *Updater
 )
+
+// reverseLines 翻转字符串切片
+func reverseLines(lines []string) {
+	for i, j := 0, len(lines)-1; i < j; i, j = i+1, j-1 {
+		lines[i], lines[j] = lines[j], lines[i]
+	}
+}
 
 func main() {
 	logFile, err := os.OpenFile("forwarder.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
@@ -41,10 +50,19 @@ global_access_control:
   blacklist_enabled: false
   blacklist_list_name: ""
 ip_lists:
-  admin-ips:
-    - "127.0.0.1"
-  blocked-ips:
-    - "0.0.0.0"
+  whitelists:
+    example-whitelist:
+      - "192.168.1.1"
+  blacklists:
+    example-blacklist:
+      - "8.8.8.8"
+  ip_sets:
+    trusted-country:
+      - "1.0.0.0/8"
+  country_ip_lists:
+    cn-ips:
+      type: country
+      source: CN
 rules:
   - name: "example-rule"
     protocol: "tcp"
@@ -53,8 +71,8 @@ rules:
     forward_addr: "127.0.0.1"
     forward_port: 22
     access_control:
-      mode: "disabled"
-      list_name: ""
+      mode: "whitelist"
+      list_name: "example-whitelist"
     enabled: true
 `)
 		if err := os.WriteFile("config.yml", exampleConfig, 0644); err != nil {
@@ -69,50 +87,19 @@ rules:
 	currentConfig = config
 	log.Println("配置加载成功。")
 
-	ipFilterManager = NewIPFilterManager(currentConfig.IPLists, currentConfig.GlobalAccessControl)
+	ipFilterManager = NewIPFilterManager(currentConfig)
 	connManager := NewConnectionManager()
+	forwarderManager = NewForwarderManager(connManager, ipFilterManager)
+	updater = NewUpdater(ipFilterManager)
+
+	updater.Start() // 启动后台更新服务
 
 	log.Println("准备启动转发器...")
 	for _, rule := range currentConfig.Rules {
-		if !rule.Enabled {
+		if rule.Enabled {
+			forwarderManager.StartRule(rule)
+		} else {
 			log.Printf("规则 [%s] 已被禁用，跳过启动。", rule.Name)
-			continue
-		}
-		
-		proto := strings.ToLower(rule.Protocol)
-		
-		if strings.Contains(proto, "tcp") {
-			tcpRule := rule
-			if strings.Contains(proto, ",") { // More robust check for combined protocols
-				baseProto := "tcp"
-				if tcpRule.ListenAddr == "0.0.0.0" {
-					tcpRule.Protocol = baseProto + "4"
-				} else if tcpRule.ListenAddr == "::" {
-					tcpRule.Protocol = baseProto + "6"
-				} else {
-					tcpRule.Protocol = baseProto
-				}
-			}
-			go startTCPForwarder(tcpRule, connManager, ipFilterManager)
-		}
-		
-		if strings.Contains(proto, "udp") {
-			udpRule := rule
-			if strings.Contains(proto, ",") {
-				baseProto := "udp"
-				if udpRule.ListenAddr == "0.0.0.0" {
-					udpRule.Protocol = baseProto + "4"
-				} else if udpRule.ListenAddr == "::" {
-					udpRule.Protocol = baseProto + "6"
-				} else {
-					udpRule.Protocol = baseProto
-				}
-			}
-			go startUDPForwarder(udpRule, connManager, ipFilterManager)
-		}
-		
-		if !strings.Contains(proto, "tcp") && !strings.Contains(proto, "udp") {
-			log.Printf("警告: 规则 [%s] 使用了不支持的协议 '%s'，已跳过。", rule.Name, rule.Protocol)
 		}
 	}
 	log.Println("所有转发器已在后台启动。")
@@ -144,66 +131,81 @@ rules:
 
 	api := router.Group("/api")
 	{
-		// ... Rules, Logs, Actions, Connections, IP Lists APIs remain unchanged ...
 		api.GET("/rules", func(c *gin.Context) {
 			configMutex.RLock()
 			defer configMutex.RUnlock()
 			c.JSON(http.StatusOK, currentConfig.Rules)
 		})
+
 		api.POST("/rules", func(c *gin.Context) {
 			var newRule Rule
 			if err := c.ShouldBindJSON(&newRule); err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "无效的规则数据: " + err.Error()}); return
+				c.JSON(http.StatusBadRequest, gin.H{"error": "无效的规则数据: " + err.Error()})
+				return
 			}
 			configMutex.Lock()
 			defer configMutex.Unlock()
 			for _, r := range currentConfig.Rules {
 				if r.Name == newRule.Name {
-					c.JSON(http.StatusConflict, gin.H{"error": "规则名称 '" + newRule.Name + "' 已存在"}); return
+					c.JSON(http.StatusConflict, gin.H{"error": "规则名称 '" + newRule.Name + "' 已存在"})
+					return
 				}
 			}
 			currentConfig.Rules = append(currentConfig.Rules, newRule)
 			data, _ := yaml.Marshal(currentConfig)
 			os.WriteFile("config.yml", data, 0644)
+			if newRule.Enabled {
+				forwarderManager.StartRule(newRule)
+			}
+			log.Printf("[Manager] 已添加并启动新规则 [%s]", newRule.Name)
 			c.JSON(http.StatusOK, newRule)
 		})
+
 		api.PUT("/rules/:name", func(c *gin.Context) {
 			ruleName := c.Param("name")
 			var updatedRule Rule
 			if err := c.ShouldBindJSON(&updatedRule); err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "无效的规则数据: " + err.Error()}); return
+				c.JSON(http.StatusBadRequest, gin.H{"error": "无效的规则数据: " + err.Error()})
+				return
 			}
-
 			configMutex.Lock()
 			defer configMutex.Unlock()
-
 			if ruleName != updatedRule.Name {
 				for _, r := range currentConfig.Rules {
 					if r.Name == updatedRule.Name {
-						c.JSON(http.StatusConflict, gin.H{"error": "规则名称 '" + updatedRule.Name + "' 已存在"}); return
+						c.JSON(http.StatusConflict, gin.H{"error": "规则名称 '" + updatedRule.Name + "' 已存在"})
+						return
 					}
 				}
 			}
-
 			found := false
 			for i, r := range currentConfig.Rules {
 				if r.Name == ruleName {
+					forwarderManager.StopRule(r.Name)
 					currentConfig.Rules[i] = updatedRule
 					found = true
 					break
 				}
 			}
 			if !found {
-				c.JSON(http.StatusNotFound, gin.H{"error": "未找到规则: " + ruleName}); return
+				c.JSON(http.StatusNotFound, gin.H{"error": "未找到规则: " + ruleName})
+				return
 			}
+			if updatedRule.Enabled {
+				forwarderManager.StartRule(updatedRule)
+			}
+			log.Printf("[Manager] 已更新规则 [%s]", updatedRule.Name)
 			data, _ := yaml.Marshal(currentConfig)
 			os.WriteFile("config.yml", data, 0644)
 			c.JSON(http.StatusOK, updatedRule)
 		})
+
 		api.DELETE("/rules/:name", func(c *gin.Context) {
 			ruleName := c.Param("name")
 			configMutex.Lock()
 			defer configMutex.Unlock()
+			forwarderManager.StopRule(ruleName)
+			log.Printf("[Manager] 已停止规则 [%s]", ruleName)
 			foundIndex := -1
 			for i, r := range currentConfig.Rules {
 				if r.Name == ruleName {
@@ -212,7 +214,8 @@ rules:
 				}
 			}
 			if foundIndex == -1 {
-				c.JSON(http.StatusNotFound, gin.H{"error": "未找到规则: " + ruleName}); return
+				c.JSON(http.StatusNotFound, gin.H{"error": "未找到规则: " + ruleName})
+				return
 			}
 			currentConfig.Rules = append(currentConfig.Rules[:foundIndex], currentConfig.Rules[foundIndex+1:]...)
 			data, _ := yaml.Marshal(currentConfig)
@@ -224,48 +227,84 @@ rules:
 			ruleName := c.Param("name")
 			configMutex.Lock()
 			defer configMutex.Unlock()
-
-			found := false
 			var newState bool
+			found := false
 			for i, r := range currentConfig.Rules {
 				if r.Name == ruleName {
 					currentConfig.Rules[i].Enabled = !r.Enabled
 					newState = currentConfig.Rules[i].Enabled
+					if newState {
+						forwarderManager.StartRule(currentConfig.Rules[i])
+						log.Printf("[Manager] 已启动规则 [%s]", ruleName)
+					} else {
+						forwarderManager.StopRule(ruleName)
+						log.Printf("[Manager] 已停止规则 [%s]", ruleName)
+					}
 					found = true
 					break
 				}
 			}
-
 			if !found {
-				c.JSON(http.StatusNotFound, gin.H{"error": "未找到规则: " + ruleName}); return
+				c.JSON(http.StatusNotFound, gin.H{"error": "未找到规则: " + ruleName})
+				return
 			}
-
 			data, _ := yaml.Marshal(currentConfig)
 			os.WriteFile("config.yml", data, 0644)
 			c.JSON(http.StatusOK, gin.H{"message": "规则 '" + ruleName + "' 状态已切换", "enabled": newState})
 		})
 
 		api.GET("/logs", func(c *gin.Context) {
-			c.Writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
 			ruleFilter := c.Query("rule")
+			page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+			pageSize, _ := strconv.Atoi(c.DefaultQuery("pageSize", "20"))
+
+			if page < 1 {
+				page = 1
+			}
+			if pageSize < 1 {
+				pageSize = 20
+			}
+
 			file, err := os.Open("forwarder.log")
-			if err != nil { c.String(http.StatusInternalServerError, "无法打开日志文件"); return }
-			defer file.Close()
-			if ruleFilter == "" || ruleFilter == "all" {
-				logData, _ := io.ReadAll(file)
-				c.String(http.StatusOK, string(logData))
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "无法打开日志文件"})
 				return
 			}
-			var filteredLogs strings.Builder
+			defer file.Close()
+
+			var allLines []string
 			scanner := bufio.NewScanner(file)
 			filterTag := "[" + ruleFilter + "]"
+
 			for scanner.Scan() {
 				line := scanner.Text()
-				if strings.Contains(line, filterTag) {
-					filteredLogs.WriteString(line + "\n")
+				if ruleFilter == "" || ruleFilter == "all" || strings.Contains(line, filterTag) {
+					allLines = append(allLines, line)
 				}
 			}
-			c.String(http.StatusOK, filteredLogs.String())
+
+			reverseLines(allLines)
+
+			totalLogs := len(allLines)
+			totalPages := int(math.Ceil(float64(totalLogs) / float64(pageSize)))
+			start := (page - 1) * pageSize
+			end := start + pageSize
+
+			if start > totalLogs {
+				start = totalLogs
+			}
+			if end > totalLogs {
+				end = totalLogs
+			}
+
+			paginatedLogs := allLines[start:end]
+
+			c.JSON(http.StatusOK, gin.H{
+				"logs":        paginatedLogs,
+				"currentPage": page,
+				"totalPages":  totalPages,
+				"totalLogs":   totalLogs,
+			})
 		})
 
 		api.POST("/actions/restart", func(c *gin.Context) {
@@ -282,28 +321,67 @@ rules:
 			defer configMutex.RUnlock()
 			c.JSON(http.StatusOK, currentConfig.IPLists)
 		})
+		
 		api.PUT("/ip-lists", func(c *gin.Context) {
-			var newIPLists map[string][]string
+			var newIPLists IPLists
 			if err := c.ShouldBindJSON(&newIPLists); err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "无效的数据格式: " + err.Error()}); return
+				c.JSON(http.StatusBadRequest, gin.H{"error": "无效的数据格式: " + err.Error()})
+				return
 			}
+			
 			configMutex.Lock()
 			defer configMutex.Unlock()
+			
+			// Handle deleted lists
+			// Note: This logic needs to be more robust if lists can be renamed.
+			// For now, it handles simple deletions across all categories.
+			existingNames := make(map[string]bool)
+			for name := range newIPLists.Whitelists { existingNames[name] = true }
+			for name := range newIPLists.Blacklists { existingNames[name] = true }
+			for name := range newIPLists.IPSets { existingNames[name] = true }
+			for name := range newIPLists.CountryIPLists { existingNames[name] = true }
+
+			for name := range currentConfig.IPLists.Whitelists { if !existingNames[name] { ipFilterManager.RemoveList(name) } }
+			for name := range currentConfig.IPLists.Blacklists { if !existingNames[name] { ipFilterManager.RemoveList(name) } }
+			for name := range currentConfig.IPLists.IPSets { if !existingNames[name] { ipFilterManager.RemoveList(name) } }
+			for name := range currentConfig.IPLists.CountryIPLists { if !existingNames[name] { ipFilterManager.RemoveList(name) } }
+			
 			currentConfig.IPLists = newIPLists
 			data, _ := yaml.Marshal(currentConfig)
 			if err := os.WriteFile("config.yml", data, 0644); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "写入配置文件失败"}); return
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "写入配置文件失败"})
+				return
 			}
-			ipFilterManager.UpdateLists(currentConfig.IPLists)
+
+			ipFilterManager.UpdateAllManualLists(currentConfig.IPLists)
+			go updater.runUpdateCycle()
+
 			log.Println("[Manager] IP名单配置已更新并立即生效。")
 			c.JSON(http.StatusOK, currentConfig.IPLists)
+		})
+		
+		api.POST("/ip-lists/:name/refresh", func(c *gin.Context) {
+			listName := c.Param("name")
+			configMutex.RLock()
+			listConfig, ok := currentConfig.IPLists.CountryIPLists[listName]
+			configMutex.RUnlock()
+
+			if !ok {
+				c.JSON(http.StatusNotFound, gin.H{"error": "未找到动态IP名单: " + listName})
+				return
+			}
+
+			go updater.updateList(listName, listConfig)
+
+			c.JSON(http.StatusOK, gin.H{"message": "已触发对名单 '" + listName + "' 的后台刷新。"})
 		})
 		
 		api.POST("/connections/:id/disconnect", func(c *gin.Context) {
 			idStr := c.Param("id")
 			id, err := strconv.ParseInt(idStr, 10, 64)
 			if err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "无效的连接ID"}); return
+				c.JSON(http.StatusBadRequest, gin.H{"error": "无效的连接ID"})
+				return
 			}
 			if connManager.Disconnect(id) {
 				c.JSON(http.StatusOK, gin.H{"message": "连接 " + idStr + " 已断开"})
@@ -311,34 +389,7 @@ rules:
 				c.JSON(http.StatusNotFound, gin.H{"error": "未找到连接 " + idStr})
 			}
 		})
-
-		api.POST("/ip-lists/:name/add", func(c *gin.Context) {
-			listName := c.Param("name")
-			var payload struct {
-				IP string `json:"ip"`
-			}
-			if err := c.ShouldBindJSON(&payload); err != nil || payload.IP == "" {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "无效的IP数据"}); return
-			}
-			configMutex.Lock()
-			defer configMutex.Unlock()
-			if list, ok := currentConfig.IPLists[listName]; ok {
-				for _, ip := range list {
-					if ip == payload.IP {
-						c.JSON(http.StatusConflict, gin.H{"message": "IP " + payload.IP + " 已存在于 " + listName}); return
-					}
-				}
-				currentConfig.IPLists[listName] = append(list, payload.IP)
-			} else {
-				c.JSON(http.StatusNotFound, gin.H{"error": "未找到IP名单: " + listName}); return
-			}
-			data, _ := yaml.Marshal(currentConfig)
-			os.WriteFile("config.yml", data, 0644)
-			ipFilterManager.UpdateLists(currentConfig.IPLists)
-			c.JSON(http.StatusOK, gin.H{"message": "IP " + payload.IP + " 已添加到 " + listName})
-		})
-
-		// --- 修正: 全局访问控制 API ---
+		
 		api.GET("/global-acl", func(c *gin.Context) {
 			configMutex.RLock()
 			defer configMutex.RUnlock()
@@ -348,19 +399,18 @@ rules:
 		api.PUT("/global-acl", func(c *gin.Context) {
 			var newGlobalAC GlobalAccessControl
 			if err := c.ShouldBindJSON(&newGlobalAC); err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "无效的数据格式: " + err.Error()}); return
+				c.JSON(http.StatusBadRequest, gin.H{"error": "无效的数据格式: " + err.Error()})
+				return
 			}
 			configMutex.Lock()
 			defer configMutex.Unlock()
-
 			currentConfig.GlobalAccessControl = newGlobalAC
 			data, _ := yaml.Marshal(currentConfig)
 			if err := os.WriteFile("config.yml", data, 0644); err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "写入配置文件失败"}); return
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "写入配置文件失败"})
+				return
 			}
-			
 			ipFilterManager.UpdateGlobalAC(newGlobalAC)
-
 			c.JSON(http.StatusOK, gin.H{"message": "全局访问控制配置已更新并立即生效。"})
 		})
 	}
