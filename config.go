@@ -15,7 +15,6 @@ type WebSecurityConfig struct {
 
 type WebTLSConfig struct {
 	Enabled        bool   `yaml:"enabled" json:"Enabled"`
-	ForceHTTPS     bool   `yaml:"force_https" json:"ForceHTTPS"` // 新增
 	MinVersion     string `yaml:"min_version" json:"MinVersion"`
 	HTTP3Enabled   bool   `yaml:"http3_enabled" json:"HTTP3Enabled"`
 	ECHEnabled     bool   `yaml:"ech_enabled" json:"ECHEnabled"`
@@ -74,8 +73,6 @@ type WebSubRuleUserAgentFilter struct {
 type WebSubRule struct {
 	Name            string                  `yaml:"name" json:"Name"`
 	Enabled         bool                    `yaml:"enabled" json:"Enabled"`
-	OperationMode   string                  `yaml:"operation_mode" json:"OperationMode"`
-	Tag             string                  `yaml:"tag" json:"Tag"`
 	ServiceType     string                  `yaml:"service_type" json:"ServiceType"`
 	FrontendAddress string                  `yaml:"frontend_address" json:"FrontendAddress"`
 	Backend         WebSubRuleBackend       `yaml:"backend" json:"Backend"`
@@ -86,9 +83,11 @@ type WebSubRule struct {
 	ClientIP        WebSubRuleClientIP      `yaml:"client_ip" json:"ClientIP"`
 	CORSEnabled     bool                    `yaml:"cors_enabled" json:"CORSEnabled"`
 	Auth            WebSubRuleAuth          `yaml:"auth" json:"Auth"`
-	IPFilter        RuleAccessControl       `yaml:"ip_filter" json:"IPFilter"`
+	IPFilter        RuleAccessControl       `yaml:"ip_filter" json:"IPFilter"` // **MODIFIED**: Added IPFilter
 	UserAgentFilter WebSubRuleUserAgentFilter `yaml:"user_agent_filter" json:"UserAgentFilter"`
 	CustomRobotTxt  string                  `yaml:"custom_robot_txt" json:"CustomRobotTxt"`
+	ForceHTTPS      bool                    `yaml:"force_https" json:"ForceHTTPS"`
+	// **MODIFIED**: Removed OperationMode and Tag
 }
 
 
@@ -107,8 +106,6 @@ type WebServiceRule struct {
 	SubRules       []WebSubRule      `yaml:"sub_rules" json:"SubRules"`
 }
 
-
-// (原有结构保持不变)
 type LogCleanupByTime struct {
 	Enabled bool   `yaml:"enabled" json:"Enabled"`
 	Mode    string `yaml:"mode" json:"Mode"`

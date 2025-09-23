@@ -68,7 +68,7 @@ rules:
     - name: test-all
       protocol: tcp,udp
       listen_addr: 0.0.0.0
-      listen_port: 2223
+      listen_port: 80
       forward_addr: 192.168.122.250
       forward_port: 3389
       access_control:
@@ -97,8 +97,8 @@ rules:
         list_name: ""
       enabled: true
     - name: 测试
-      protocol: tcp
-      listen_addr: ""
+      protocol: tcp6
+      listen_addr: '::'
       listen_port: 22226
       forward_addr: 192.168.122.250
       forward_port: 3389
@@ -171,8 +171,8 @@ web_services:
       enabled: true
       listen_ipv4: true
       listen_ipv6: true
-      listen_addr: ""
-      listen_port: 81
+      listen_addr: fe80::ac2:a1ff:fe44:c7d8
+      listen_port: 82
       access_control:
         mode: disabled
         list_name: ""
@@ -181,7 +181,6 @@ web_services:
         block_on_block_count: 0
       tls:
         enabled: false
-        force_https: true
         min_version: TLS1.2
         http3_enabled: false
         ech_enabled: false
@@ -200,8 +199,6 @@ web_services:
       sub_rules:
         - name: "01"
           enabled: true
-          operation_mode: custom
-          tag: ""
           service_type: reverse_proxy
           frontend_address: cnyun.de
           backend:
@@ -210,7 +207,7 @@ web_services:
             use_target_host_header: false
             grpc_secure: false
             disable_keep_alives: false
-          redirect_url: ""
+          redirect_url: http://baidu.com
           coraza_waf: 无
           security:
             block_on_404_count: 0
@@ -237,3 +234,34 @@ web_services:
             mode: disabled
             list: []
           custom_robot_txt: ""
+          force_https: false
+    - name: 02test
+      enabled: true
+      listen_ipv4: true
+      listen_ipv6: true
+      listen_addr: ""
+      listen_port: 80
+      access_control:
+        mode: disabled
+        list_name: ""
+      security:
+        block_on_404_count: 0
+        block_on_block_count: 0
+      tls:
+        enabled: false
+        min_version: TLS1.2
+        http3_enabled: false
+        ech_enabled: false
+      apply_to_sub_rules: false
+      limits:
+        rule_rate_limit:
+            send_speed_kbps: 0
+            receive_speed_kbps: 0
+        connection_rate_limit:
+            send_speed_kbps: 0
+            receive_speed_kbps: 0
+        ip_rate_limit:
+            send_speed_kbps: 0
+            receive_speed_kbps: 0
+        ip_connection_limit: 0
+      sub_rules: []

@@ -293,16 +293,12 @@ web_services: []
 
 	log.Println("准备启动转发器...")
 	for _, rule := range currentConfig.Rules {
-		if rule.Enabled {
-			forwarderManager.StartRule(rule)
-		}
+		forwarderManager.StartRule(rule)
 	}
 	
 	log.Println("准备启动Web服务...")
 	for _, rule := range currentConfig.WebServices {
-		if rule.Enabled {
-			webManager.StartRule(rule)
-		}
+		webManager.StartRule(rule)
 	}
 
 	log.Println("所有服务已在后台启动。")
@@ -368,6 +364,15 @@ web_services: []
 			c.JSON(http.StatusOK, currentConfig.WebServices)
 		})
 
+		api.GET("/web-rules/status", func(c *gin.Context) {
+			configMutex.RLock()
+			rules := currentConfig.WebServices
+			configMutex.RUnlock()
+			statuses := webManager.GetRuleStatuses(rules)
+			c.JSON(http.StatusOK, statuses)
+		})
+
+
 		api.POST("/web-rules", func(c *gin.Context) {
 			var newRule WebServiceRule
 			if err := c.ShouldBindJSON(&newRule); err != nil {
@@ -385,7 +390,9 @@ web_services: []
 			currentConfig.WebServices = append(currentConfig.WebServices, newRule)
 			data, _ := yaml.Marshal(currentConfig)
 			os.WriteFile(*configPath, data, 0644)
+			
 			webManager.StartRule(newRule)
+			
 			log.Printf("[Manager] 已添加并启动新的Web服务规则 [%s]", newRule.Name)
 			c.JSON(http.StatusOK, newRule)
 		})
@@ -405,6 +412,7 @@ web_services: []
 				if r.Name == ruleName {
 					webManager.StopRule(r.Name)
 					currentConfig.WebServices[i] = updatedRule
+					webManager.StartRule(updatedRule)
 					found = true
 					break
 				}
@@ -413,7 +421,7 @@ web_services: []
 				c.JSON(http.StatusNotFound, gin.H{"error": "未找到Web服务规则: " + ruleName})
 				return
 			}
-			webManager.StartRule(updatedRule)
+
 			log.Printf("[Manager] 已更新Web服务规则 [%s]", updatedRule.Name)
 			data, _ := yaml.Marshal(currentConfig)
 			os.WriteFile(*configPath, data, 0644)
@@ -441,6 +449,7 @@ web_services: []
 			currentConfig.WebServices = append(currentConfig.WebServices[:foundIndex], currentConfig.WebServices[foundIndex+1:]...)
 			data, _ := yaml.Marshal(currentConfig)
 			os.WriteFile(*configPath, data, 0644)
+			log.Printf("[Manager] 已删除并停止Web服务规则 [%s]", ruleName)
 			c.JSON(http.StatusOK, gin.H{"message": "Web服务规则 '" + ruleName + "' 已成功删除"})
 		})
 		
@@ -455,9 +464,10 @@ web_services: []
 					currentConfig.WebServices[i].Enabled = !r.Enabled
 					newState = currentConfig.WebServices[i].Enabled
 					
-					webManager.StopRule(r.Name)
 					if newState {
 						webManager.StartRule(currentConfig.WebServices[i])
+					} else {
+						webManager.StopRule(r.Name)
 					}
 					
 					found = true
@@ -484,7 +494,7 @@ web_services: []
 			configMutex.Lock()
 			defer configMutex.Unlock()
 
-			found := false
+			var parentRule *WebServiceRule
 			for i, r := range currentConfig.WebServices {
 				if r.Name == ruleName {
 					for _, sr := range r.SubRules {
@@ -494,17 +504,21 @@ web_services: []
 						}
 					}
 					currentConfig.WebServices[i].SubRules = append(r.SubRules, subRule)
-					found = true
+					parentRule = &currentConfig.WebServices[i]
 					break
 				}
 			}
 
-			if !found {
+			if parentRule == nil {
 				c.JSON(http.StatusNotFound, gin.H{"error": "未找到父规则: " + ruleName})
 				return
 			}
+			
+			webManager.RestartRule(*parentRule)
+
 			data, _ := yaml.Marshal(currentConfig)
 			os.WriteFile(*configPath, data, 0644)
+			log.Printf("[Manager] 已为 [%s] 添加子规则 [%s] 并重启服务", ruleName, subRule.Name)
 			c.JSON(http.StatusOK, subRule)
 		})
 
@@ -519,10 +533,9 @@ web_services: []
 			configMutex.Lock()
 			defer configMutex.Unlock()
 
-			parentFound := false
+			var parentRule *WebServiceRule
 			for i, r := range currentConfig.WebServices {
 				if r.Name == ruleName {
-					parentFound = true
 					subFound := false
 					for j, sr := range r.SubRules {
 						if sr.Name == subRuleName {
@@ -535,16 +548,21 @@ web_services: []
 						c.JSON(http.StatusNotFound, gin.H{"error": "未找到子规则: " + subRuleName})
 						return
 					}
+					parentRule = &currentConfig.WebServices[i]
 					break
 				}
 			}
 
-			if !parentFound {
+			if parentRule == nil {
 				c.JSON(http.StatusNotFound, gin.H{"error": "未找到父规则: " + ruleName})
 				return
 			}
+			
+			webManager.RestartRule(*parentRule)
+
 			data, _ := yaml.Marshal(currentConfig)
 			os.WriteFile(*configPath, data, 0644)
+			log.Printf("[Manager] 已更新子规则 [%s]@[%s] 并重启服务", subRuleName, ruleName)
 			c.JSON(http.StatusOK, updatedSubRule)
 		})
 
@@ -554,10 +572,9 @@ web_services: []
 			configMutex.Lock()
 			defer configMutex.Unlock()
 
-			parentFound := false
+			var parentRule *WebServiceRule
 			for i, r := range currentConfig.WebServices {
 				if r.Name == ruleName {
-					parentFound = true
 					foundIndex := -1
 					for j, sr := range r.SubRules {
 						if sr.Name == subRuleName {
@@ -570,17 +587,61 @@ web_services: []
 						return
 					}
 					currentConfig.WebServices[i].SubRules = append(r.SubRules[:foundIndex], r.SubRules[foundIndex+1:]...)
+					parentRule = &currentConfig.WebServices[i]
 					break
 				}
 			}
 
-			if !parentFound {
+			if parentRule == nil {
 				c.JSON(http.StatusNotFound, gin.H{"error": "未找到父规则: " + ruleName})
 				return
 			}
+
+			webManager.RestartRule(*parentRule)
+
 			data, _ := yaml.Marshal(currentConfig)
 			os.WriteFile(*configPath, data, 0644)
+			log.Printf("[Manager] 已删除子规则 [%s]@[%s] 并重启服务", subRuleName, ruleName)
 			c.JSON(http.StatusOK, gin.H{"message": "子规则 '" + subRuleName + "' 已成功删除"})
+		})
+		
+		api.POST("/web-rules/:name/sub-rules/:subRuleName/toggle", func(c *gin.Context) {
+			ruleName := c.Param("name")
+			subRuleName := c.Param("subRuleName")
+			configMutex.Lock()
+			defer configMutex.Unlock()
+
+			var parentRule *WebServiceRule
+			var subRule *WebSubRule
+			var newState bool
+
+			for i, r := range currentConfig.WebServices {
+				if r.Name == ruleName {
+					parentRule = &currentConfig.WebServices[i]
+					for j, sr := range r.SubRules {
+						if sr.Name == subRuleName {
+							subRule = &currentConfig.WebServices[i].SubRules[j]
+							break
+						}
+					}
+					break
+				}
+			}
+			
+			if parentRule == nil || subRule == nil {
+				c.JSON(http.StatusNotFound, gin.H{"error": "未找到规则或子规则"})
+				return
+			}
+			
+			subRule.Enabled = !subRule.Enabled
+			newState = subRule.Enabled
+			
+			webManager.RestartRule(*parentRule)
+
+			data, _ := yaml.Marshal(currentConfig)
+			os.WriteFile(*configPath, data, 0644)
+			log.Printf("[Manager] 已切换子规则 [%s]@[%s] 状态为: %v 并重启服务", subRuleName, ruleName, newState)
+			c.JSON(http.StatusOK, gin.H{"message": "子规则状态已切换", "enabled": newState})
 		})
 
 		// --- Rules APIs ---
@@ -589,6 +650,15 @@ web_services: []
 			defer configMutex.RUnlock()
 			c.JSON(http.StatusOK, currentConfig.Rules)
 		})
+
+		api.GET("/rules/status", func(c *gin.Context) {
+			configMutex.RLock()
+			rules := currentConfig.Rules
+			configMutex.RUnlock()
+			statuses := forwarderManager.GetRuleStatuses(rules)
+			c.JSON(http.StatusOK, statuses)
+		})
+
 
 		api.POST("/rules", func(c *gin.Context) {
 			var newRule Rule
@@ -607,9 +677,9 @@ web_services: []
 			currentConfig.Rules = append(currentConfig.Rules, newRule)
 			data, _ := yaml.Marshal(currentConfig)
 			os.WriteFile(*configPath, data, 0644)
-			if newRule.Enabled {
-				forwarderManager.StartRule(newRule)
-			}
+			
+			forwarderManager.StartRule(newRule)
+			
 			log.Printf("[Manager] 已添加并启动新规则 [%s]", newRule.Name)
 			c.JSON(http.StatusOK, newRule)
 		})
@@ -644,9 +714,9 @@ web_services: []
 				c.JSON(http.StatusNotFound, gin.H{"error": "未找到规则: " + ruleName})
 				return
 			}
-			if updatedRule.Enabled {
-				forwarderManager.StartRule(updatedRule)
-			}
+			
+			forwarderManager.StartRule(updatedRule)
+			
 			log.Printf("[Manager] 已更新规则 [%s]", updatedRule.Name)
 			data, _ := yaml.Marshal(currentConfig)
 			os.WriteFile(*configPath, data, 0644)
@@ -688,11 +758,10 @@ web_services: []
 					newState = currentConfig.Rules[i].Enabled
 					if newState {
 						forwarderManager.StartRule(currentConfig.Rules[i])
-						log.Printf("[Manager] 已启动规则 [%s]", ruleName)
 					} else {
 						forwarderManager.StopRule(ruleName)
-						log.Printf("[Manager] 已停止规则 [%s]", ruleName)
 					}
+					log.Printf("[Manager] 规则 [%s] 状态已切换为: %v", ruleName, newState)
 					found = true
 					break
 				}

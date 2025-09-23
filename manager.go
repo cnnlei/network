@@ -40,12 +40,51 @@ type ConnectionManager struct {
 }
 
 func NewConnectionManager() *ConnectionManager {
-	return &ConnectionManager{
+	m := &ConnectionManager{
 		connections: make(map[int64]*ConnectionInfo),
 		clients:     make(map[*websocket.Conn]bool),
 		nextConnID:  1,
 	}
+	// **FIX**: Start the cleanup goroutine to remove stale connections.
+	go m.startCleanupTask()
+	return m
 }
+
+// **NEW**: startCleanupTask periodically calls the cleanup function.
+func (m *ConnectionManager) startCleanupTask() {
+	ticker := time.NewTicker(10 * time.Second) // Check every 10 seconds
+	defer ticker.Stop()
+	for {
+		<-ticker.C
+		m.cleanupStaleConnections()
+	}
+}
+
+// **NEW**: cleanupStaleConnections removes connections that are stuck in "Matching..." state for too long.
+func (m *ConnectionManager) cleanupStaleConnections() {
+	m.mu.Lock()
+	var idsToClose []int64
+	staleThreshold := 15 * time.Second 
+	var connectionsToClose []net.Conn
+
+	for id, connInfo := range m.connections {
+		if connInfo.Protocol == "WEB" && connInfo.TargetAddr == "匹配中..." && time.Since(connInfo.StartTime) > staleThreshold {
+			idsToClose = append(idsToClose, id)
+			if connInfo.conn != nil {
+				connectionsToClose = append(connectionsToClose, connInfo.conn)
+			}
+		}
+	}
+	m.mu.Unlock() // Unlock before closing connections to avoid deadlock
+	
+	if len(idsToClose) > 0 {
+		log.Printf("[Manager] 清理 %d 个陈旧的 '匹配中' 连接", len(idsToClose))
+		for _, conn := range connectionsToClose {
+			conn.Close() // This will trigger RemoveByConn and its broadcast
+		}
+	}
+}
+
 
 func readRecentLogs(filePath string, n int) (string, map[string][]string, error) {
 	file, err := os.Open(filePath)
@@ -108,7 +147,6 @@ func (m *ConnectionManager) Add(protocol, rule string, clientConn, targetConn ne
 	return connID
 }
 
-// AddHTTPConn adds a connection from an HTTP server
 func (m *ConnectionManager) AddHTTPConn(conn net.Conn, ruleName, subRuleName string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -120,19 +158,41 @@ func (m *ConnectionManager) AddHTTPConn(conn net.Conn, ruleName, subRuleName str
 		Rule:       ruleName,
 		SubRule:    subRuleName,
 		ClientAddr: conn.RemoteAddr().String(),
-		TargetAddr: conn.LocalAddr().String(),
+		TargetAddr: "匹配中...",
 		StartTime:  time.Now(),
 		conn:       conn,
+	}
+	go m.Broadcast()
+}
+
+func (m *ConnectionManager) UpdateSubRuleForConn(conn net.Conn, subRuleName string, frontendAddress string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var needsBroadcast bool
+	for _, c := range m.connections {
+		if c.conn == conn {
+			if c.SubRule != subRuleName || c.TargetAddr != frontendAddress {
+				c.SubRule = subRuleName
+				c.TargetAddr = frontendAddress
+				needsBroadcast = true
+			}
+			break
+		}
+	}
+	if needsBroadcast {
+		go m.Broadcast()
 	}
 }
 
 func (m *ConnectionManager) Remove(id int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	delete(m.connections, id)
+	if _, ok := m.connections[id]; ok {
+		delete(m.connections, id)
+		go m.Broadcast()
+	}
 }
 
-// RemoveByConn removes a connection using the net.Conn object as a key
 func (m *ConnectionManager) RemoveByConn(conn net.Conn) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -145,6 +205,7 @@ func (m *ConnectionManager) RemoveByConn(conn net.Conn) {
 	}
 	if idToRemove != -1 {
 		delete(m.connections, idToRemove)
+		go m.Broadcast()
 	}
 }
 
@@ -162,11 +223,10 @@ func (m *ConnectionManager) Disconnect(id int64) bool {
 	m.mu.Lock()
 	conn, ok := m.connections[id]
 	m.mu.Unlock()
-	if ok {
+
+	if ok && conn.conn != nil {
 		log.Printf("[Manager] 正在断开连接 ID: %d", id)
-		if conn.conn != nil {
-			conn.conn.Close()
-		}
+		conn.conn.Close() // This will trigger RemoveByConn and its broadcast
 		return true
 	}
 	return false
@@ -186,7 +246,6 @@ func (m *ConnectionManager) Broadcast() {
 	conns := m.GetAll()
 	recentLogs, logsByRule, err := readRecentLogs("forwarder.log", 50)
 	if err != nil {
-		// Don't log error if file doesn't exist yet
 		if !os.IsNotExist(err) {
 			log.Printf("[Manager] 读取最新日志失败: %v", err)
 		}
