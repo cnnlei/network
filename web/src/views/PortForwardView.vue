@@ -6,6 +6,7 @@ import IconLink from '../components/icons/IconLink.vue';
 import IconLogs from '../components/icons/IconLogs.vue';
 
 const rules = ref([]);
+const ruleStatuses = ref({}); // **NEW**: To store live statuses
 const ipLists = ref({
   whitelists: {},
   blacklists: {},
@@ -119,10 +120,24 @@ const connectWebSocket = () => {
   socket.onclose = () => setTimeout(connectWebSocket, 3000);
 };
 
+const fetchRuleStatuses = async () => {
+    try {
+        const response = await fetch(getApiUrl('/api/rules/status'));
+        if(response.ok) {
+            ruleStatuses.value = await response.json();
+        }
+    } catch (error) {
+        console.error('获取规则状态失败:', error);
+    }
+};
+
 const fetchRules = async () => {
   try {
     const response = await fetch(getApiUrl('/api/rules'));
-    if (response.ok) { rules.value = await response.json() || []; }
+    if (response.ok) {
+        rules.value = await response.json() || [];
+        await fetchRuleStatuses();
+    }
   } catch (error) { console.error('加载规则列表失败:', error); }
 };
 
@@ -240,6 +255,7 @@ const toggleRule = async (rule) => {
     const result = await response.json();
     if (response.ok) {
       rule.Enabled = result.enabled;
+      fetchRuleStatuses(); // Refresh statuses
     } else {
       alert(`切换失败: ${result.error}`);
     }
@@ -254,7 +270,7 @@ const deleteRule = async (ruleName) => {
     const response = await fetch(getApiUrl(`/api/rules/${ruleName}`), { method: 'DELETE' });
     const result = await response.json();
     if (response.ok) {
-      fetchRules();
+      fetchRules(); // This will also trigger a status fetch
     } else { alert(`删除失败: ${result.error}`); }
   } catch (error) { alert('删除请求失败'); }
 };
@@ -310,7 +326,7 @@ const handleSubmit = async () => {
     const result = await response.json();
     if (response.ok) {
       isRuleModalOpen.value = false;
-      fetchRules();
+      fetchRules(); // This will also trigger a status fetch
     } else { alert(`操作失败: ${result.error}`); }
   } catch (error) { alert('请求失败'); }
 };
@@ -459,7 +475,12 @@ onUnmounted(() => {
               <button @click="deleteRule(rule.Name)" class="action-btn delete-btn" title="删除"><IconDelete /></button>
             </div>
           </div>
-          <div class="rule-name">{{ rule.Name }}</div>
+          <div class="rule-name-status">
+            <div class="rule-name">{{ rule.Name }}</div>
+            <span :class="['status-tag', ruleStatuses[rule.Name]]">
+              {{ ruleStatuses[rule.Name] === 'running' ? '运行中' : (ruleStatuses[rule.Name] === 'error' ? '错误' : '已停止') }}
+            </span>
+          </div>
           <div class="rule-protocol">{{ rule.Protocol.toUpperCase() }}</div>
           <div class="rule-path">
             <span>{{ rule.ListenAddr || '*' }}:{{ rule.ListenPort }}</span>
@@ -744,12 +765,16 @@ input:checked + .slider:before { transform: translateX(18px); }
 .form-row { display: flex; gap: 1rem; }
 .form-section { border: 1px solid #f0f0f0; border-radius: 8px; padding: 1rem 1.5rem; margin-bottom: 1.5rem; }
 .form-section h4 { margin-top: 0; margin-bottom: 1rem; border-bottom: 1px solid #eee; padding-bottom: 0.75rem; font-size: 1.1rem; color: #333; }
-
+.rule-name-status { display: flex; align-items: center; gap: 10px; margin-bottom: 0.5rem; }
+.status-tag { padding: 2px 8px; border-radius: 12px; font-size: 0.75rem; font-weight: 500; }
+.status-tag.running { background-color: #d4edda; color: #155724; }
+.status-tag.stopped { background-color: #e2e3e5; color: #383d41; }
+.status-tag.error { background-color: #f8d7da; color: #721c24; }
 .logs-container-modal {
   background-color: #282c34;
   color: #dcdfe4;
   border-radius: 5px;
-  height: 50vh;
+  height: 65vh;
   overflow-y: auto;
   white-space: pre-wrap;
   word-break: break-all;
@@ -784,6 +809,8 @@ input:checked + .slider:before { transform: translateX(18px); }
   flex-grow: 1;
   max-height: 250px;
   overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 
 .pagination-controls {
