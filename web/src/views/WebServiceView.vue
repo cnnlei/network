@@ -22,6 +22,9 @@ const originalSubRuleName = ref('');
 // --- IP Lists State ---
 const ipLists = ref({ whitelists: {}, blacklists: {}, ip_sets: {}, country_ip_lists: {}, url_ip_sets: {} });
 
+// --- WAF State ---
+const wafRuleSets = ref([]);
+
 // --- Real-time Data State ---
 const connections = ref([]);
 const connectionsForModal = ref([]);
@@ -84,6 +87,12 @@ const tooltipContent = ref([]);
 const tooltipTop = ref(0);
 const tooltipLeft = ref(0);
 let hideTooltipTimeout = null;
+const tooltipCurrentPage = ref(1);
+const tooltipTotalPages = ref(1);
+const tooltipRuleName = ref('');
+const tooltipPageSize = ref(10);
+const tooltipJumpToPage = ref(1);
+
 
 // --- Log Modal State ---
 const isLogModalOpen = ref(false);
@@ -142,6 +151,17 @@ const connectWebSocket = () => {
 
 
 // --- API Fetching Logic ---
+const fetchWafRuleSets = async () => {
+  try {
+    const response = await fetch(getApiUrl('/api/waf/rulesets'));
+    if (response.ok) {
+      wafRuleSets.value = await response.json() || [];
+    }
+  } catch (error) {
+    console.error('加载 WAF 规则集失败:', error);
+  }
+};
+
 const fetchRuleStatuses = async () => {
     try {
         const response = await fetch(getApiUrl('/api/web-rules/status'));
@@ -182,11 +202,38 @@ const fetchPaginatedLogs = async (ruleName, page, pageSize) => {
 // --- Log Display Logic ---
 const showLogTooltip = async (event, ruleName) => {
     clearTimeout(hideTooltipTimeout);
+    tooltipRuleName.value = ruleName;
+    tooltipCurrentPage.value = 1;
     isTooltipVisible.value = true;
     tooltipContent.value = ["加载中..."];
 
     await nextTick();
+    positionTooltip(event);
+    await loadTooltipLogs();
+};
 
+const loadTooltipLogs = async () => {
+    try {
+        const data = await fetchPaginatedLogs(tooltipRuleName.value, tooltipCurrentPage.value, tooltipPageSize.value);
+        tooltipContent.value = data.logs.length > 0 ? data.logs : ['暂无日志记录'];
+        tooltipTotalPages.value = data.totalPages;
+        tooltipJumpToPage.value = tooltipCurrentPage.value;
+    } catch (e) {
+        tooltipContent.value = ['日志加载失败'];
+    }
+};
+
+const handleTooltipJump = () => {
+    const page = parseInt(tooltipJumpToPage.value, 10);
+    if (!isNaN(page) && page > 0 && page <= tooltipTotalPages.value) {
+        tooltipCurrentPage.value = page;
+        loadTooltipLogs();
+    } else {
+        tooltipJumpToPage.value = tooltipCurrentPage.value;
+    }
+}
+
+const positionTooltip = (event) => {
     if (!tooltipRef.value) return;
 
     const rect = event.currentTarget.getBoundingClientRect();
@@ -208,14 +255,6 @@ const showLogTooltip = async (event, ruleName) => {
 
     tooltipTop.value = top;
     tooltipLeft.value = left;
-
-
-    try {
-        const data = await fetchPaginatedLogs(ruleName, 1, 10);
-        tooltipContent.value = data.logs.length > 0 ? data.logs : ['暂无日志记录'];
-    } catch (e) {
-        tooltipContent.value = ['日志加载失败'];
-    }
 };
 
 const hideLogTooltip = () => {
@@ -223,6 +262,11 @@ const hideLogTooltip = () => {
 };
 const cancelTooltipHide = () => clearTimeout(hideTooltipTimeout);
 
+const handleViewDetailsClick = (ruleName) => {
+    isTooltipVisible.value = false;
+    clearTimeout(hideTooltipTimeout);
+    openLogModal(ruleName);
+};
 
 const openLogModal = async (ruleName) => {
   ruleForLogModal.value = ruleName;
@@ -334,6 +378,12 @@ const openAddMainModal = () => {
       IPRateLimit: { SendSpeedKBps: 0, ReceiveSpeedKBps: 0 },
       IPConnectionLimit: 0,
     },
+    UnmatchedRequest: {
+      Action: 'not_found',
+      ProxyAddress: '',
+      RedirectURL: '',
+      StaticText: 'Not Found',
+    },
     SubRules: []
   };
   isMainModalOpen.value = true;
@@ -393,13 +443,20 @@ const openAddSubModal = (mainRule) => {
     RedirectURL: '', CorazaWAF: '无',
     Security: { BlockOn404Count: 0, BlockOnCorazaCount: 0 },
     Network: { DisableConnectionReuse: false, NetworkType: 'tcp', HttpClientTimeoutSec: 30 },
-    ClientIP: { FromHeader: false, AddToHeader: false, AddToHeaderName: 'X-Forwarded-For', AddProtoToHeader: false, AddProtoToHeaderName: 'X-Forwarded-Proto' },
+    ClientIP: { FromHeader: false, FromHeaderName: 'X-Forwarded-For', AddToHeader: false, AddToHeaderName: 'X-Forwarded-For', AddProtoToHeader: false, AddProtoToHeaderName: 'X-Forwarded-Proto', AddHostToHeader: false, AddHostToHeaderName: 'X-Forwarded-Host' },
+    ForwardedHeaders: { Enabled: true },
     CORSEnabled: false,
     Auth: { Enabled: false, Username: '', Password: '' },
     IPFilter: { Mode: 'disabled', ListName: '' },
     UserAgentFilter: { Mode: 'disabled', List: [] },
     CustomRobotTxt: '',
     ForceHTTPS: false,
+    Limits: {
+      RuleRateLimit: { SendSpeedKBps: 0, ReceiveSpeedKBps: 0 },
+      ConnectionRateLimit: { SendSpeedKBps: 0, ReceiveSpeedKBps: 0 },
+      IPRateLimit: { SendSpeedKBps: 0, ReceiveSpeedKBps: 0 },
+      IPConnectionLimit: 0,
+    },
   };
   isSubModalOpen.value = true;
 };
@@ -407,7 +464,10 @@ const openAddSubModal = (mainRule) => {
 const openEditSubModal = (mainRule, subRule) => {
     subModalMode.value = 'edit';
     currentMainRule.value = mainRule;
-    currentSubRule.value = JSON.parse(JSON.stringify(subRule));
+    currentSubRule.value = {
+        ForwardedHeaders: { Enabled: true }, 
+        ...JSON.parse(JSON.stringify(subRule))
+    };
     originalSubRuleName.value = subRule.Name;
     isSubModalOpen.value = true;
 };
@@ -454,6 +514,11 @@ const toggleSubRule = async (mainRuleName, subRule) => {
     }
 };
 
+const handleGlobalClick = (event) => {
+    if (isTooltipVisible.value && tooltipRef.value && !tooltipRef.value.contains(event.target)) {
+        isTooltipVisible.value = false;
+    }
+};
 
 watch(selectedCategory, () => {
     selectedIpList.value = '';
@@ -463,10 +528,13 @@ onMounted(() => {
   connectWebSocket();
   fetchWebRules();
   fetchIPLists();
+  fetchWafRuleSets();
+  window.addEventListener('mousedown', handleGlobalClick);
 });
 
 onUnmounted(() => {
   if (socket) socket.close();
+  window.removeEventListener('mousedown', handleGlobalClick);
 });
 </script>
 
@@ -603,7 +671,75 @@ onUnmounted(() => {
 
             </div>
           </div>
-
+          <div class="form-section">
+              <h4>速率与连接数限制 (主规则)</h4>
+              <p class="description">主规则的限制会覆盖所有子规则的限制。0 表示不限制。</p>
+              <div class="form-row">
+                  <div class="form-group">
+                      <label>单IP连接数</label>
+                      <input type="number" v-model.number="currentMainRule.Limits.IPConnectionLimit">
+                  </div>
+              </div>
+              <h5>主规则速率限制 (整个规则生效)</h5>
+               <div class="form-row">
+                  <div class="form-group">
+                      <label>总上传速率 (KB/s)</label>
+                      <input type="number" v-model.number="currentMainRule.Limits.RuleRateLimit.SendSpeedKBps">
+                  </div>
+                  <div class="form-group">
+                      <label>总下载速率 (KB/s)</label>
+                      <input type="number" v-model.number="currentMainRule.Limits.RuleRateLimit.ReceiveSpeedKBps">
+                  </div>
+              </div>
+               <h5>单连接速率限制</h5>
+               <div class="form-row">
+                  <div class="form-group">
+                      <label>单连接上传速率 (KB/s)</label>
+                      <input type="number" v-model.number="currentMainRule.Limits.ConnectionRateLimit.SendSpeedKBps">
+                  </div>
+                  <div class="form-group">
+                      <label>单连接下载速率 (KB/s)</label>
+                      <input type="number" v-model.number="currentMainRule.Limits.ConnectionRateLimit.ReceiveSpeedKBps">
+                  </div>
+              </div>
+              <h5>单IP速率限制</h5>
+               <div class="form-row">
+                  <div class="form-group">
+                      <label>单IP上传速率 (KB/s)</label>
+                      <input type="number" v-model.number="currentMainRule.Limits.IPRateLimit.SendSpeedKBps">
+                  </div>
+                  <div class="form-group">
+                      <label>单IP下载速率 (KB/s)</label>
+                      <input type="number" v-model.number="currentMainRule.Limits.IPRateLimit.ReceiveSpeedKBps">
+                  </div>
+              </div>
+          </div>
+           <div class="form-section">
+                <h4>未匹配请求处理</h4>
+                <p class="description">当请求的域名(Host)未匹配任何子规则时，执行以下操作。</p>
+                <div class="form-group">
+                    <label>操作类型</label>
+                    <select v-model="currentMainRule.UnmatchedRequest.Action">
+                        <option value="not_found">返回 404 Not Found (默认)</option>
+                        <option value="close">关闭连接</option>
+                        <option value="proxy">反向代理</option>
+                        <option value="redirect">302重定向</option>
+                        <option value="static_text">返回静态文本</option>
+                    </select>
+                </div>
+                 <div class="form-group" v-if="currentMainRule.UnmatchedRequest.Action === 'proxy'">
+                    <label>代理地址</label>
+                    <input type="text" v-model="currentMainRule.UnmatchedRequest.ProxyAddress" placeholder="例如: http://127.0.0.1:8080">
+                </div>
+                <div class="form-group" v-if="currentMainRule.UnmatchedRequest.Action === 'redirect'">
+                    <label>重定向 URL</label>
+                    <input type="text" v-model="currentMainRule.UnmatchedRequest.RedirectURL" placeholder="例如: https://google.com">
+                </div>
+                <div class="form-group" v-if="currentMainRule.UnmatchedRequest.Action === 'static_text'">
+                    <label>静态文本内容</label>
+                    <textarea v-model="currentMainRule.UnmatchedRequest.StaticText" rows="3"></textarea>
+                </div>
+            </div>
           <div class="form-section">
             <h4>TLS / HTTPS 设置</h4>
             <div class="form-group toggle-group"><label>启用 TLS (HTTPS)</label><input class="main-toggle" type="checkbox" v-model="currentMainRule.TLS.Enabled"></div>
@@ -667,6 +803,27 @@ onUnmounted(() => {
                 <div v-if="currentSubRule.ServiceType === 'redirect'" class="form-group"><label>重定向URL</label><input type="text" v-model="currentSubRule.RedirectURL"></div>
             </div>
             
+            <div v-if="currentSubRule.ServiceType === 'reverse_proxy'" class="form-section">
+                <h4>反向代理请求头</h4>
+                 <div class="form-group toggle-group">
+                    <label>自动添加常见反向代理请求头</label>
+                    <input type="checkbox" class="main-toggle" v-model="currentSubRule.ForwardedHeaders.Enabled">
+                </div>
+                <p class="description">启用后，将自动添加 X-Real-IP, X-Forwarded-For, X-Forwarded-Proto, X-Real-Proto, X-Forwarded-Host, X-Forwarded-Port 等请求头。</p>
+            </div>
+
+            <div v-if="currentSubRule.ServiceType === 'reverse_proxy'" class="form-section">
+                <h4>客户端IP与协议头</h4>
+                <div class="form-group toggle-group">
+                  <label>优先从Header头部获取客户端IP</label>
+                  <input type="checkbox" class="main-toggle" v-model="currentSubRule.ClientIP.FromHeader">
+                </div>
+                 <div v-if="currentSubRule.ClientIP.FromHeader" class="form-group">
+                  <label>Header名称</label>
+                  <input type="text" v-model="currentSubRule.ClientIP.FromHeaderName">
+                </div>
+            </div>
+
             <div class="form-section">
                 <h4>IP 访问控制 (子规则)</h4>
                 <div class="form-row">
@@ -698,20 +855,89 @@ onUnmounted(() => {
                     </div>
                 </div>
             </div>
-
+            <div class="form-section">
+                <h4>速率与连接数限制 (子规则)</h4>
+                <p class="description">如果主规则设置了限制，则此处的限制无效。0 表示不限制。</p>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>单IP连接数</label>
+                        <input type="number" v-model.number="currentSubRule.Limits.IPConnectionLimit">
+                    </div>
+                </div>
+                <h5>子规则速率限制 (整个子规则生效)</h5>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>总上传速率 (KB/s)</label>
+                        <input type="number" v-model.number="currentSubRule.Limits.RuleRateLimit.SendSpeedKBps">
+                    </div>
+                    <div class="form-group">
+                        <label>总下载速率 (KB/s)</label>
+                        <input type="number" v-model.number="currentSubRule.Limits.RuleRateLimit.ReceiveSpeedKBps">
+                    </div>
+                </div>
+                <h5>单连接速率限制</h5>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>单连接上传速率 (KB/s)</label>
+                        <input type="number" v-model.number="currentSubRule.Limits.ConnectionRateLimit.SendSpeedKBps">
+                    </div>
+                    <div class="form-group">
+                        <label>单连接下载速率 (KB/s)</label>
+                        <input type="number" v-model.number="currentSubRule.Limits.ConnectionRateLimit.ReceiveSpeedKBps">
+                    </div>
+                </div>
+                <h5>单IP速率限制</h5>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>单IP上传速率 (KB/s)</label>
+                        <input type="number" v-model.number="currentSubRule.Limits.IPRateLimit.SendSpeedKBps">
+                    </div>
+                    <div class="form-group">
+                        <label>单IP下载速率 (KB/s)</label>
+                        <input type="number" v-model.number="currentSubRule.Limits.IPRateLimit.ReceiveSpeedKBps">
+                    </div>
+                </div>
+            </div>
             <div v-if="currentSubRule.ServiceType === 'reverse_proxy'" class="form-section">
                 <h4>后端设置</h4>
                 <div class="checkbox-group wrap">
                     <label><input type="checkbox" v-model="currentSubRule.Backend.IgnoreTLSCert"> 忽略后端TLS证书验证</label>
                     <label><input type="checkbox" v-model="currentSubRule.Backend.UseTargetHostHeader"> 使用目标地址Host请求头</label>
                     <label><input type="checkbox" v-model="currentSubRule.Backend.GrpcSecure"> grpc使用安全连接</label>
-                    <label><input type="checkbox" v-model="currentSubRule.Backend.DisableKeepAlives"> 禁用长连接</label>
+                    <label><input type="checkbox" v-model="currentSubRule.Network.DisableConnectionReuse"> 禁用连接复用</label>
+                </div>
+            </div>
+             <div v-if="currentSubRule.ServiceType === 'reverse_proxy'" class="form-section">
+                <h4>其他</h4>
+                 <div class="form-group toggle-group">
+                    <label>授权认证</label>
+                    <input type="checkbox" class="main-toggle" v-model="currentSubRule.Auth.Enabled">
+                </div>
+                 <div v-if="currentSubRule.Auth.Enabled" class="form-row">
+                    <div class="form-group">
+                        <label>用户名</label>
+                        <input type="text" v-model="currentSubRule.Auth.Username">
+                    </div>
+                    <div class="form-group">
+                        <label>密码</label>
+                        <input type="password" v-model="currentSubRule.Auth.Password">
+                    </div>
+                </div>
+                <div class="form-group toggle-group">
+                    <label>跨域支持 (CORS)</label>
+                    <input type="checkbox" class="main-toggle" v-model="currentSubRule.CORSEnabled">
                 </div>
             </div>
             <div class="form-section">
                 <h4>安全与WAF</h4>
                 <div class="form-row">
-                    <div class="form-group"><label>Coraza WAF</label><select v-model="currentSubRule.CorazaWAF"><option>无</option></select></div>
+                    <div class="form-group">
+                        <label>Coraza WAF</label>
+                        <select v-model="currentSubRule.CorazaWAF">
+                            <option value="无">无</option>
+                            <option v-for="rs in wafRuleSets" :key="rs.Name" :value="rs.Name">{{ rs.Name }}</option>
+                        </select>
+                    </div>
                     <div class="form-group"><label>单IP连续404限制</label><input type="number" v-model.number="currentSubRule.Security.BlockOn404Count"></div>
                     <div class="form-group"><label>单IP Coraza拦截限制</label><input type="number" v-model.number="currentSubRule.Security.BlockOnCorazaCount"></div>
                 </div>
@@ -725,19 +951,35 @@ onUnmounted(() => {
     </div>
 
     <div v-if="isTooltipVisible" ref="tooltipRef" class="tooltip" :style="{ top: tooltipTop + 'px', left: tooltipLeft + 'px' }" @mouseenter="cancelTooltipHide" @mouseleave="hideLogTooltip">
-      <pre>{{ tooltipContent.join('\n') }}</pre>
+        <pre>{{ tooltipContent.join('\n') }}</pre>
+        <div class="tooltip-pagination">
+            <div class="pagination-left">
+                <select v-model="tooltipPageSize" @change="loadTooltipLogs">
+                    <option :value="10">10/页</option>
+                    <option :value="20">20/页</option>
+                    <option :value="50">50/页</option>
+                </select>
+                <button @click="tooltipCurrentPage > 1 && (tooltipCurrentPage--, loadTooltipLogs())" :disabled="tooltipCurrentPage <= 1">‹</button>
+                <div class="page-jump-tooltip">
+                    <input type="number" v-model.number="tooltipJumpToPage" @keyup.enter="handleTooltipJump" min="1" :max="tooltipTotalPages">
+                    <span>/{{ tooltipTotalPages }}</span>
+                </div>
+                <button @click="tooltipCurrentPage < tooltipTotalPages && (tooltipCurrentPage++, loadTooltipLogs())" :disabled="tooltipCurrentPage >= tooltipTotalPages">›</button>
+            </div>
+            <a href="#" @click.prevent="handleViewDetailsClick(tooltipRuleName)" class="tooltip-details-link">查看详情</a>
+        </div>
     </div>
 
     <div v-if="isLogModalOpen" class="modal-overlay" @click.self="isLogModalOpen = false">
       <div class="modal-content large">
         <h2>日志: {{ ruleForLogModal }}</h2>
-        <pre v-if="isLoadingLogs" class="logs-container-modal">加载中...</pre>
+        <div v-if="isLoadingLogs" class="empty-state-small">加载中...</div>
         <pre v-else class="logs-container-modal">{{ logsForModal.join('\n') }}</pre>
         <div class="pagination-controls">
            <select v-model="logModalPageSize" @change="loadModalLogs">
+                <option :value="20">20/页</option>
                 <option :value="50">50/页</option>
                 <option :value="100">100/页</option>
-                <option :value="200">200/页</option>
             </select>
             <button @click="logModalCurrentPage > 1 && (logModalCurrentPage--, loadModalLogs())" :disabled="logModalCurrentPage <= 1">上一页</button>
             <div class="page-jump">
@@ -749,7 +991,7 @@ onUnmounted(() => {
         </div>
       </div>
     </div>
-
+    
     <div v-if="isConnModalOpen" class="modal-overlay" @click.self="isConnModalOpen = false">
       <div class="modal-content large">
         <h2>实时连接: {{ ruleForConnModal.sub ? `${ruleForConnModal.main} / ${ruleForConnModal.sub}` : ruleForConnModal.main }}</h2>
@@ -781,7 +1023,7 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <div v-if="isAddIpModalOpen" class="modal-overlay" @click.self="isAddIpModalOpen = false">
+     <div v-if="isAddIpModalOpen" class="modal-overlay" @click.self="isAddIpModalOpen = false">
         <div class="modal-content">
             <h2>添加到IP名单</h2>
             <p>将 IP <strong>{{ ipToAdd }}</strong> 添加到...</p>
@@ -810,7 +1052,6 @@ onUnmounted(() => {
             </div>
         </div>
     </div>
-
   </div>
 </template>
 
@@ -849,11 +1090,12 @@ onUnmounted(() => {
 .form-section { border-bottom: 1px solid #eee; padding-bottom: 1rem; margin-bottom: 1rem; }
 .form-section:last-of-type { border-bottom: none; }
 .form-section h4 { margin-top: 0; margin-bottom: 1rem; color: #333; }
+.form-section h5 { margin-top: 1.5rem; margin-bottom: 1rem; font-size: 1rem; color: #555; border-bottom: 1px solid #eee; padding-bottom: 0.5rem;}
 .form-group { margin-bottom: 1rem; }
 .form-row { display: flex; gap: 1rem; }
 .form-row .form-group { flex: 1; }
 .form-group label { display: block; margin-bottom: 0.5rem; font-weight: 500; }
-.form-group input[type="text"], .form-group input[type="number"], .form-group select { width: 100%; padding: 0.7rem; border: 1px solid #e0e0e0; border-radius: 5px; font-size: 1rem; box-sizing: border-box; }
+.form-group input[type="text"], .form-group input[type="number"], .form-group input[type="password"], .form-group select, .form-group textarea { width: 100%; padding: 0.7rem; border: 1px solid #e0e0e0; border-radius: 5px; font-size: 1rem; box-sizing: border-box; }
 .toggle-group { display: flex; align-items: center; justify-content: space-between; }
 .checkbox-group { display: flex; gap: 1rem; align-items: center; }
 .checkbox-group.wrap { flex-wrap: wrap; }
@@ -862,8 +1104,17 @@ onUnmounted(() => {
 .form-actions { margin-top: 2rem; display: flex; justify-content: flex-end; gap: 1rem; }
 .btn-cancel { background-color: #e0e0e0; color: #333; border: none; padding: 0.7rem 1.5rem; border-radius: 5px; font-weight: 500; }
 .btn-save { background-color: #007bff; color: white; border: none; padding: 0.7rem 1.5rem; border-radius: 5px; font-weight: 500; }
-.tooltip { position: fixed; background-color: rgba(40, 44, 52, 0.95); color: #dcdfe4; border: 1px solid #555; border-radius: 5px; padding: 0.75rem; font-family: "SFMono-Regular", Consolas, Menlo, monospace; font-size: 0.75rem; z-index: 2000; max-width: 800px; pointer-events: auto; }
+.tooltip { position: fixed; background-color: rgba(40, 44, 52, 0.95); color: #dcdfe4; border: 1px solid #555; border-radius: 5px; padding: 0.75rem; font-family: "SFMono-Regular", Consolas, Menlo, monospace; font-size: 0.75rem; z-index: 2000; max-width: 800px; }
 .tooltip pre { margin: 0; max-height: 250px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
+.tooltip-pagination { display: flex; justify-content: space-between; align-items: center; margin-top: 8px; gap: 5px; }
+.tooltip-pagination .pagination-left { display: flex; align-items: center; gap: 5px; }
+.tooltip-pagination button { background: #555; color: white; border: none; cursor: pointer; padding: 2px 6px; }
+.tooltip-pagination button:disabled { background: #333; cursor: not-allowed; }
+.tooltip-pagination select { background: #555; color: white; border: 1px solid #777; font-size: 0.7rem; }
+.page-jump.small-jump input { width: 35px; text-align: center; font-size: 0.7rem; padding: 2px; }
+.page-jump.small-jump { color: #ccc; }
+.tooltip-details-link { color: #a7c5eb; text-decoration: none; cursor: pointer; }
+.tooltip-details-link:hover { text-decoration: underline; }
 .logs-container-modal { background-color: #282c34; color: #dcdfe4; border-radius: 5px; height: 50vh; overflow-y: auto; padding: 1rem; margin-bottom: 1rem; white-space: pre-wrap; word-break: break-all;}
 .pagination-controls { display: flex; justify-content: center; align-items: center; gap: 10px; padding-top: 10px; }
 .page-jump input { width: 50px; text-align: center; }

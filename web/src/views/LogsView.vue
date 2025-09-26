@@ -1,12 +1,30 @@
 <script setup>
-import { ref, onMounted, watch } from 'vue';
+import { ref, onMounted, watch, computed } from 'vue';
 
 const historicalLogs = ref([]);
 const isLoadingLogs = ref(false);
-const logTheme = ref('dark');
+const logTheme = ref('dark'); // This will now control the container, not the text color directly
 const rules = ref([]);
+const webRules = ref([]);
 const selectedLogRule = ref('all');
 const isSettingsModalOpen = ref(false);
+
+const allRules = computed(() => {
+    const combined = [];
+    if (rules.value) {
+        rules.value.forEach(r => combined.push({ Name: r.Name, Type: '端口转发' }));
+    }
+    if (webRules.value) {
+        webRules.value.forEach(wr => {
+            combined.push({ Name: wr.Name, Type: 'Web服务' });
+            if (wr.SubRules) {
+                wr.SubRules.forEach(sr => combined.push({ Name: `${wr.Name} ${sr.Name}`, Type: 'Web子规则' }));
+            }
+        });
+    }
+    return combined;
+});
+
 
 const logSettings = ref({
   CleanupByTime: { Enabled: false, Mode: 'days', Value: 7 },
@@ -32,10 +50,40 @@ const jumpToPage = ref(1);
 
 const getApiUrl = (endpoint) => `http://${window.location.hostname}:8080${endpoint}`;
 
-// 新增：确保所有规则都有一个默认的清理设置
+// --- NEW: Log Parsing Logic ---
+const logLineRegex = /^(\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}:\d{2}) (\[.*?\]) (.*)$/s;
+const legoLogRegex = /^(\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}:\d{2}) \[(INFO|WARN|ERROR)\]\s*(\[.*?\])?\s?(acme:.*)$/s;
+
+const parseLogLine = (line) => {
+    let match = line.match(legoLogRegex);
+    if (match) {
+        return { timestamp: match[1], level: match[2], tag: match[3] || '', message: match[4] };
+    }
+    match = line.match(logLineRegex);
+    if (match) {
+        let level = 'INFO';
+        const msgUpper = match[3].toUpperCase();
+        const tagUpper = match[2].toUpperCase();
+
+        if (tagUpper.includes("WARN") || msgUpper.includes("WARN")) level = 'WARN';
+        if (tagUpper.includes("ERROR") || msgUpper.includes("ERROR") || msgUpper.includes("FAIL")) level = 'ERROR';
+        
+        return { timestamp: match[1], level: level, tag: match[2], message: match[3] };
+    }
+    return { timestamp: '', level: 'RAW', tag: '', message: line };
+};
+
+const getLogLevelClass = (level) => {
+    if (level === 'WARN') return 'log-warn';
+    if (level === 'ERROR') return 'log-error';
+    return 'log-info';
+};
+// --- END: Log Parsing Logic ---
+
+
 const ensureRuleSettings = () => {
-    if (!rules.value || !logSettings.value.CleanupByRule) return;
-    rules.value.forEach(rule => {
+    if (!allRules.value || !logSettings.value.CleanupByRule) return;
+    allRules.value.forEach(rule => {
         if (!logSettings.value.CleanupByRule[rule.Name]) {
             logSettings.value.CleanupByRule[rule.Name] = { Enabled: false, RetainLines: 1000 };
         }
@@ -44,31 +92,35 @@ const ensureRuleSettings = () => {
 
 const fetchRules = async () => {
   try {
-    const response = await fetch(getApiUrl('/api/rules'));
-    if (response.ok) {
-        rules.value = await response.json() || [];
-        if (rules.value.length > 0 && !manualCleanup.value.ruleName) {
-            manualCleanup.value.ruleName = rules.value[0].Name;
-        }
-        ensureRuleSettings(); // 获取规则后，确保设置对象完整
+    const [rulesRes, webRulesRes] = await Promise.all([
+        fetch(getApiUrl('/api/rules')),
+        fetch(getApiUrl('/api/web-rules'))
+    ]);
+    
+    if (rulesRes.ok) rules.value = await rulesRes.json() || [];
+    if (webRulesRes.ok) webRules.value = await webRulesRes.json() || [];
+
+    if (allRules.value.length > 0 && !manualCleanup.value.ruleName) {
+        manualCleanup.value.ruleName = allRules.value[0].Name;
     }
+    ensureRuleSettings();
   } catch (error) { console.error('加载规则列表失败:', error); }
 };
 
 const fetchLogs = async () => {
   isLoadingLogs.value = true;
-  historicalLogs.value = ['正在加载完整的日志...'];
+  historicalLogs.value = [];
   try {
     const ruleParam = selectedLogRule.value;
     const response = await fetch(getApiUrl(`/api/logs?rule=${ruleParam}&page=${currentPage.value}&pageSize=${pageSize.value}`));
     if (response.ok) {
       const data = await response.json();
-      historicalLogs.value = data.logs.length > 0 ? data.logs : ['该规则下暂无日志记录。'];
+      historicalLogs.value = data.logs || [];
       totalPages.value = data.totalPages;
       totalLogs.value = data.totalLogs;
       jumpToPage.value = currentPage.value;
     } else {
-      historicalLogs.value = [`加载日志失败`];
+      historicalLogs.value = [`加载日志失败: ${await response.text()}`];
     }
   } catch (error) {
     historicalLogs.value = ['加载失败，无法连接到API。'];
@@ -86,7 +138,7 @@ const fetchLogSettings = async () => {
                 logSettings.value.CleanupByTime = Object.assign({ Enabled: false, Mode: 'days', Value: 7 }, data.Log.CleanupByTime);
                 logSettings.value.CleanupByLines = Object.assign({ Enabled: false, RetainLines: 10000 }, data.Log.CleanupByLines);
                 logSettings.value.CleanupByRule = data.Log.CleanupByRule || {};
-                ensureRuleSettings(); // 获取设置后，再次确保对象完整
+                ensureRuleSettings();
             }
         }
     } catch(e) { console.error("获取日志设置失败", e); }
@@ -171,7 +223,7 @@ onMounted(() => {
          <div class="log-filter">
             <select id="rule-select" v-model="selectedLogRule">
               <option value="all">所有规则</option>
-              <option v-for="rule in rules" :key="rule.Name" :value="rule.Name">{{ rule.Name }}</option>
+              <option v-for="rule in allRules" :key="rule.Name" :value="rule.Name">{{ rule.Name }} ({{ rule.Type }})</option>
             </select>
           </div>
           <button @click="isSettingsModalOpen = true" class="btn-secondary">日志设置与清理</button>
@@ -181,7 +233,16 @@ onMounted(() => {
        </div>
     </div>
     
-    <pre class="logs-container" :class="logTheme === 'dark' ? 'dark-theme' : 'light-theme'">{{ historicalLogs.join('\n') }}</pre>
+    <div class="logs-container" :class="logTheme === 'dark' ? 'dark-theme' : 'light-theme'">
+        <div v-if="isLoadingLogs" class="empty-state-small">正在加载日志...</div>
+        <div v-else-if="historicalLogs.length === 0" class="empty-state-small">该规则下暂无日志记录。</div>
+        <div v-else v-for="(line, index) in historicalLogs" :key="index" class="log-line">
+            <span class="log-time">{{ parseLogLine(line).timestamp }}</span>
+            <span :class="['log-level', getLogLevelClass(parseLogLine(line).level)]">{{ parseLogLine(line).level }}</span>
+            <span class="log-tag">{{ parseLogLine(line).tag }}</span>
+            <span class="log-message">{{ parseLogLine(line).message }}</span>
+        </div>
+    </div>
     
     <div class="pagination-controls-footer">
         <select v-model="pageSize">
@@ -241,7 +302,7 @@ onMounted(() => {
               <div v-if="manualCleanup.cleanupType === 'rule_lines'" class="form-group inline">
                 <label>对于规则</label>
                  <select v-model="manualCleanup.ruleName">
-                    <option v-for="rule in rules" :key="rule.Name" :value="rule.Name">{{ rule.Name }}</option>
+                    <option v-for="rule in allRules" :key="rule.Name" :value="rule.Name">{{ rule.Name }}</option>
                  </select>
                 <label>保留最新的</label>
                 <input type="number" v-model.number="manualCleanup.retainLines">
@@ -290,7 +351,7 @@ onMounted(() => {
               <div class="form-section">
                 <h4>按规则条数 (对每个规则独立生效)</h4>
                 <div class="rule-cleanup-list">
-                    <div v-for="rule in rules" :key="rule.Name" class="form-group inline rule-item">
+                    <div v-for="rule in allRules" :key="rule.Name" class="form-group inline rule-item">
                         <label class="rule-name">{{ rule.Name }}</label>
                         <input type="checkbox" v-model="logSettings.CleanupByRule[rule.Name].Enabled">
                         <label>启用，保留最新</label>
@@ -311,7 +372,7 @@ onMounted(() => {
 </template>
 
 <style scoped>
-/* (All styles remain the same as the previous version) */
+/* (All styles remain the same as the original version, with new log color styles added) */
 .tabs { display: flex; border-bottom: 1px solid #e0e0e0; margin-bottom: 1.5rem; }
 .tabs button { padding: 0.8rem 1.2rem; border: none; background-color: transparent; cursor: pointer; font-size: 1rem; position: relative; color: #6c757d; }
 .tabs button.active { color: #007bff; font-weight: 600; }
@@ -357,4 +418,19 @@ onMounted(() => {
 .rule-cleanup-list { max-height: 200px; overflow-y: auto; border: 1px solid #eee; padding: 1rem; border-radius: 5px; }
 .rule-item { margin-bottom: 1rem; }
 .rule-name { font-weight: 500; min-width: 120px; text-align: right; margin-right: 1rem; }
+
+/* --- NEW Log Color Styles --- */
+.log-line { display: flex; flex-wrap: nowrap; gap: 1rem; align-items: baseline; }
+.log-time { color: #999; flex-shrink: 0; }
+.light-theme .log-time { color: #666; }
+.log-level { font-weight: bold; flex-shrink: 0; text-align: center; width: 50px; }
+.log-level.log-info { color: #87cefa; }
+.log-level.log-warn { color: #ffd700; }
+.log-level.log-error { color: #f08080; }
+.log-tag { color: #add8e6; flex-shrink: 0; }
+.light-theme .log-tag { color: #007bff; }
+.log-message { flex-grow: 1; }
+.empty-state-small { text-align: center; padding: 1rem; }
+.dark-theme .empty-state-small { color: #999; }
+.light-theme .empty-state-small { color: #666; }
 </style>

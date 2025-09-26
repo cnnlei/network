@@ -11,9 +11,11 @@
         <router-link to="/web-service">Web 服务</router-link>
         <router-link to="/">端口转发</router-link>
         <router-link to="/ip-lists">IP 名单</router-link>
+        <router-link to="/waf">WAF 规则集</router-link>
         <router-link to="/global-acl">全局访问控制</router-link>
+        <router-link to="/certificates">SSL/TLS 证书</router-link>
         <router-link to="/logs">历史日志</router-link>
-        <router-link to="/settings">设置</router-link> 
+        <router-link to="/settings">设置</router-link>
       </nav>
     </aside>
     <main class="main-content">
@@ -37,6 +39,8 @@ body {
   margin: 0;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   background-color: var(--bg-color);
+  /* Apply the zoom to the entire page */
+  zoom: 0.8; 
 }
 </style>
 
@@ -46,7 +50,8 @@ body {
 }
 .sidebar {
   width: var(--sidebar-width);
-  height: 100vh;
+  /* Compensate for the zoom to fill the viewport height */
+  height: 125vh; /* 100vh / 0.8 = 125vh */
   background-color: var(--sidebar-bg);
   color: var(--sidebar-text);
   position: fixed;

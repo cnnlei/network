@@ -6,7 +6,7 @@ import IconLink from '../components/icons/IconLink.vue';
 import IconLogs from '../components/icons/IconLogs.vue';
 
 const rules = ref([]);
-const ruleStatuses = ref({}); // **NEW**: To store live statuses
+const ruleStatuses = ref({}); 
 const ipLists = ref({
   whitelists: {},
   blacklists: {},
@@ -216,6 +216,12 @@ const cancelTooltipHide = () => {
     clearTimeout(hideTooltipTimeout);
 }
 
+const handleViewDetailsClick = (ruleName) => {
+    isTooltipVisible.value = false;
+    clearTimeout(hideTooltipTimeout);
+    openLogModal({ Name: ruleName });
+};
+
 const openLogModal = async (rule) => {
   ruleForLogModal.value = rule.Name;
   isLogModalOpen.value = true;
@@ -407,8 +413,8 @@ const openEditModal = (rule) => {
   } else if (rule.ListenAddr === '::') {
     version = 'ipv6';
   } else if (rule.ListenAddr === '') {
-     if (proto.endsWith('4')) version = 'ipv4';
-     if (proto.endsWith('6')) version = 'ipv6';
+      if (proto.endsWith('4')) version = 'ipv4';
+      if (proto.endsWith('6')) version = 'ipv6';
   }
 
   if (proto.startsWith('tcp,udp')) {
@@ -659,18 +665,21 @@ onUnmounted(() => {
       @mouseenter="cancelTooltipHide"
       @mouseleave="hideLogTooltip">
       <pre>{{ tooltipContent.join('\n') }}</pre>
-       <div class="pagination-controls tooltip-pagination">
-            <select v-model="tooltipPageSize" @change="loadTooltipLogs">
-                <option :value="10">10/页</option>
-                <option :value="20">20/页</option>
-                <option :value="50">50/页</option>
-            </select>
-            <button @click="tooltipCurrentPage > 1 && (tooltipCurrentPage--, loadTooltipLogs())" :disabled="tooltipCurrentPage <= 1">‹</button>
-            <div class="page-jump-tooltip">
-                <input type="number" v-model.number="tooltipJumpToPage" @keyup.enter="handleTooltipJump" min="1" :max="tooltipTotalPages">
-                <span>/{{ tooltipTotalPages }}</span>
+       <div class="tooltip-pagination">
+            <div class="pagination-left">
+                <select v-model="tooltipPageSize" @change="loadTooltipLogs">
+                    <option :value="10">10/页</option>
+                    <option :value="20">20/页</option>
+                    <option :value="50">50/页</option>
+                </select>
+                <button @click="tooltipCurrentPage > 1 && (tooltipCurrentPage--, loadTooltipLogs())" :disabled="tooltipCurrentPage <= 1">‹</button>
+                <div class="page-jump-tooltip">
+                    <input type="number" v-model.number="tooltipJumpToPage" @keyup.enter="handleTooltipJump" min="1" :max="tooltipTotalPages">
+                    <span>/{{ tooltipTotalPages }}</span>
+                </div>
+                <button @click="tooltipCurrentPage < tooltipTotalPages && (tooltipCurrentPage++, loadTooltipLogs())" :disabled="tooltipCurrentPage >= tooltipTotalPages">›</button>
             </div>
-            <button @click="tooltipCurrentPage < tooltipTotalPages && (tooltipCurrentPage++, loadTooltipLogs())" :disabled="tooltipCurrentPage >= tooltipTotalPages">›</button>
+            <a href="#" @click.prevent="handleViewDetailsClick(tooltipRuleName)" class="tooltip-details-link">查看详情</a>
         </div>
     </div>
 
@@ -797,7 +806,6 @@ input:checked + .slider:before { transform: translateX(18px); }
   z-index: 2000;
   max-width: 800px;
   overflow: hidden;
-  pointer-events: auto;
   display: flex;
   flex-direction: column;
   transition: opacity 0.2s;
@@ -840,10 +848,24 @@ input:checked + .slider:before { transform: translateX(18px); }
     padding-top: 5px;
     margin-top: 5px;
     gap: 5px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
 }
-.tooltip-pagination button, .tooltip-pagination select {
-    padding: 1px 5px;
+.tooltip-pagination .pagination-left {
+    display: flex;
+    align-items: center;
+    gap: 5px;
 }
+.tooltip-details-link {
+    color: #a7c5eb;
+    text-decoration: none;
+    cursor: pointer;
+}
+.tooltip-details-link:hover {
+    text-decoration: underline;
+}
+
 .modal-content .pagination-controls {
     border-top: 1px solid #e0e0e0;
 }
