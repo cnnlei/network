@@ -10,21 +10,26 @@ import (
 
 // WebManager 负责管理所有Web服务的生命周期
 type WebManager struct {
-	activeServices map[string][]*http.Server // A rule can have multiple servers
-	ruleStatus     map[string]string       // **NEW**: Tracks the runtime status of each rule ("running", "stopped", "error")
-	mu             sync.Mutex
-	ipFilter       *IPFilterManager
-	connManager    *ConnectionManager
+	activeServices  map[string][]*http.Server
+	ruleStatus      map[string]string
+	mu              sync.Mutex
+	ipFilter        *IPFilterManager
+	connManager     *ConnectionManager
+	ipConnLimiter   *IPConnectionLimiter
+	wafManager      *WAFManager
 }
 
-func NewWebManager(ipFilter *IPFilterManager, connManager *ConnectionManager) *WebManager {
+func NewWebManager(ipFilter *IPFilterManager, connManager *ConnectionManager, ipConnLimiter *IPConnectionLimiter, wafManager *WAFManager) *WebManager {
 	return &WebManager{
 		activeServices: make(map[string][]*http.Server),
 		ruleStatus:     make(map[string]string),
 		ipFilter:       ipFilter,
 		connManager:    connManager,
+		ipConnLimiter:  ipConnLimiter,
+		wafManager:     wafManager,
 	}
 }
+
 
 // StartRule 启动一个新的Web服务规则
 func (m *WebManager) StartRule(rule WebServiceRule) {
@@ -42,7 +47,7 @@ func (m *WebManager) StartRule(rule WebServiceRule) {
 		return
 	}
 
-	forwarder, err := NewWebForwarder(rule, m.ipFilter, m.connManager)
+	forwarder, err := NewWebForwarder(rule, m.ipFilter, m.connManager, m.ipConnLimiter, m.wafManager)
 	if err != nil {
 		log.Printf("[WebManager] 创建规则 [%s] 失败: %v", rule.Name, err)
 		m.ruleStatus[rule.Name] = "error"
@@ -50,7 +55,6 @@ func (m *WebManager) StartRule(rule WebServiceRule) {
 	}
 
 	servers := forwarder.Start()
-	// **FIX**: If no servers were successfully started, mark the rule as having an error.
 	if len(servers) > 0 {
 		m.activeServices[rule.Name] = servers
 		m.ruleStatus[rule.Name] = "running"
@@ -67,7 +71,6 @@ func (m *WebManager) StopRule(ruleName string) {
 
 	servers, exists := m.activeServices[ruleName]
 	if !exists {
-		// If it doesn't exist, it's already stopped.
 		m.ruleStatus[ruleName] = "stopped"
 		return
 	}
@@ -91,18 +94,16 @@ func (m *WebManager) StopRule(ruleName string) {
 func (m *WebManager) GetRuleStatuses(rules []WebServiceRule) map[string]string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	
+
 	statuses := make(map[string]string)
 	for _, rule := range rules {
 		if status, ok := m.ruleStatus[rule.Name]; ok {
-			// If rule is disabled in config, it should always be "stopped"
 			if !rule.Enabled {
 				statuses[rule.Name] = "stopped"
 			} else {
 				statuses[rule.Name] = status
 			}
 		} else {
-			// If we have no status, but it's enabled, it must have failed silently before. Mark as error.
 			if rule.Enabled {
 				statuses[rule.Name] = "error"
 			} else {
@@ -113,14 +114,12 @@ func (m *WebManager) GetRuleStatuses(rules []WebServiceRule) map[string]string {
 	return statuses
 }
 
-
 // RestartRule 平滑地重启一个规则，用于应用子规则等配置变更
 func (m *WebManager) RestartRule(rule WebServiceRule) {
 	m.StopRule(rule.Name)
 	time.Sleep(200 * time.Millisecond)
 	m.StartRule(rule)
 }
-
 
 // RestartAll 根据最新的配置重启所有Web服务
 func (m *WebManager) RestartAll(rules []WebServiceRule) {

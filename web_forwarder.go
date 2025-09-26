@@ -4,18 +4,18 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/quic-go/quic-go/http3"
+	"golang.org/x/time/rate"
 )
 
 // contextKey is a private type to prevent collisions in context keys.
@@ -23,6 +23,101 @@ type contextKey string
 
 const connContextKey = contextKey("netConn")
 const subRuleContextKey = contextKey("subRule")
+
+// --- Rate Limiting Wrappers for HTTP ---
+
+// rateLimitedResponseWriter wraps http.ResponseWriter to limit response writing speed.
+type rateLimitedResponseWriter struct {
+	http.ResponseWriter
+	writer io.Writer
+}
+
+func (w *rateLimitedResponseWriter) Write(p []byte) (int, error) {
+	return w.writer.Write(p)
+}
+
+// rateLimitedRequestBody wraps io.ReadCloser to limit request body reading speed.
+type rateLimitedRequestBody struct {
+	io.ReadCloser
+	reader io.Reader
+}
+
+func (r *rateLimitedRequestBody) Read(p []byte) (int, error) {
+	return r.reader.Read(p)
+}
+
+func authMiddleware(next http.Handler, authConfig WebSubRuleAuth) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if authConfig.Enabled {
+			user, pass, ok := r.BasicAuth()
+			if !ok || user != authConfig.Username || pass != authConfig.Password {
+				w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
+				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// applyLimitsMiddleware is an HTTP middleware that applies rate limits and connection limits to a request.
+func applyLimitsMiddleware(next http.Handler, subRule WebSubRule, mainRule WebServiceRule, ipConnLimiter *IPConnectionLimiter) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		clientIP := strings.Split(r.RemoteAddr, ":")[0]
+
+		// Sub-rule IP Connection Limit Check
+		if !mainRule.ApplyToSubRules {
+			limit := subRule.Limits.IPConnectionLimit
+			if limit > 0 {
+				if !ipConnLimiter.Check(mainRule.Name, clientIP, limit) {
+					log.Printf("[%s %s] 拒绝来自 %s 的连接: 已达到子规则IP连接数限制 (%d)", mainRule.Name, subRule.Name, clientIP, limit)
+					if hj, ok := w.(http.Hijacker); ok {
+						conn, _, err := hj.Hijack()
+						if err == nil {
+							conn.Close()
+							return
+						}
+					}
+					http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
+					return
+				}
+			}
+		}
+
+		// Determine which rate limits to apply (sub-rule overrides main rule if not inherited)
+		sendLimit := mainRule.Limits.ConnectionRateLimit.SendSpeedKBps
+		recvLimit := mainRule.Limits.ConnectionRateLimit.ReceiveSpeedKBps
+
+		if !mainRule.ApplyToSubRules {
+			if subRule.Limits.ConnectionRateLimit.SendSpeedKBps > 0 {
+				sendLimit = subRule.Limits.ConnectionRateLimit.SendSpeedKBps
+			}
+			if subRule.Limits.ConnectionRateLimit.ReceiveSpeedKBps > 0 {
+				recvLimit = subRule.Limits.ConnectionRateLimit.ReceiveSpeedKBps
+			}
+		}
+
+		// Wrap ResponseWriter for send speed limiting
+		if sendLimit > 0 {
+			limiter := rate.NewLimiter(rate.Limit(sendLimit*1024), sendLimit*1024)
+			w = &rateLimitedResponseWriter{
+				ResponseWriter: w,
+				writer:         &rateLimitedWriter{w: w, limiter: limiter},
+			}
+		}
+
+		// Wrap Request.Body for receive speed limiting
+		if recvLimit > 0 {
+			limiter := rate.NewLimiter(rate.Limit(recvLimit*1024), recvLimit*1024)
+			r.Body = &rateLimitedRequestBody{
+				ReadCloser: r.Body,
+				reader:     &rateLimitedReader{r: r.Body, limiter: limiter},
+			}
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
 
 // loggingTransport is a custom http.RoundTripper that logs requests and responses.
 type loggingTransport struct {
@@ -116,23 +211,29 @@ func buildTLSConfig(tlsConfig WebTLSConfig) *tls.Config {
 
 // WebForwarder represents an individual, runnable web service instance.
 type WebForwarder struct {
-	rule        WebServiceRule
-	ipFilter    *IPFilterManager
-	connManager *ConnectionManager
+	rule          WebServiceRule
+	ipFilter      *IPFilterManager
+	connManager   *ConnectionManager
+	ipConnLimiter *IPConnectionLimiter
+	hostToSubRule map[string]WebSubRule
+	wafManager    *WAFManager
 }
 
-func NewWebForwarder(rule WebServiceRule, ipFilter *IPFilterManager, connManager *ConnectionManager) (*WebForwarder, error) {
+func NewWebForwarder(rule WebServiceRule, ipFilter *IPFilterManager, connManager *ConnectionManager, ipConnLimiter *IPConnectionLimiter, wafManager *WAFManager) (*WebForwarder, error) {
 	return &WebForwarder{
-		rule:        rule,
-		ipFilter:    ipFilter,
-		connManager: connManager,
+		rule:          rule,
+		ipFilter:      ipFilter,
+		connManager:   connManager,
+		ipConnLimiter: ipConnLimiter,
+		hostToSubRule: make(map[string]WebSubRule),
+		wafManager:    wafManager,
 	}, nil
 }
+
 
 // Start boots up the HTTP/HTTPS server(s) based on the rule configuration.
 func (wf *WebForwarder) Start() []*http.Server {
 	hostHandlers := make(map[string]http.Handler)
-	hostToSubRule := make(map[string]WebSubRule)
 
 	for _, subRule := range wf.rule.SubRules {
 		if !subRule.Enabled {
@@ -149,16 +250,81 @@ func (wf *WebForwarder) Start() []*http.Server {
 			}
 			proxy := httputil.NewSingleHostReverseProxy(target)
 
+			transport := &http.Transport{
+				Proxy: http.ProxyFromEnvironment,
+				DialContext: (&net.Dialer{
+					Timeout:   30 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}).DialContext,
+				ForceAttemptHTTP2:     true,
+				MaxIdleConns:          100,
+				IdleConnTimeout:       90 * time.Second,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ExpectContinueTimeout: 1 * time.Second,
+				TLSClientConfig:       &tls.Config{InsecureSkipVerify: subRule.Backend.IgnoreTLSCert},
+				DisableKeepAlives:     subRule.Network.DisableConnectionReuse,
+			}
+
 			proxy.Transport = &loggingTransport{
-				Transport: http.DefaultTransport,
+				Transport: transport,
 				RuleName:  wf.rule.Name,
+			}
+
+			director := proxy.Director
+			proxy.Director = func(req *http.Request) {
+				director(req)
+				if subRule.Backend.UseTargetHostHeader {
+					req.Host = target.Host
+				}
+
+				subRule, ok := req.Context().Value(subRuleContextKey).(WebSubRule)
+				if !ok {
+					return
+				}
+
+				clientIP := req.RemoteAddr
+				if subRule.ClientIP.FromHeader {
+					if headerIP := req.Header.Get(subRule.ClientIP.FromHeaderName); headerIP != "" {
+						clientIP = headerIP
+					}
+				}
+				clientIP, _, _ = net.SplitHostPort(clientIP)
+
+				if subRule.ForwardedHeaders.Enabled {
+					req.Header.Set("X-Real-IP", clientIP)
+
+					if prior, ok := req.Header["X-Forwarded-For"]; ok {
+						req.Header.Set("X-Forwarded-For", strings.Join(prior, ", ")+", "+clientIP)
+					} else {
+						req.Header.Set("X-Forwarded-For", clientIP)
+					}
+
+					proto := "http"
+					if req.TLS != nil {
+						proto = "https"
+					}
+					req.Header.Set("X-Forwarded-Proto", proto)
+					req.Header.Set("X-Real-Proto", proto)
+
+					req.Header.Set("X-Forwarded-Host", req.Host)
+
+					_, port, err := net.SplitHostPort(req.Host)
+					if err != nil {
+						if req.TLS != nil {
+							port = "443"
+						} else {
+							port = "80"
+						}
+					}
+					req.Header.Set("X-Forwarded-Port", port)
+				}
 			}
 
 			proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
 				log.Printf("[%s %s] Web代理发生严重错误: %v", wf.rule.Name, subRule.Name, err)
 				w.WriteHeader(http.StatusBadGateway)
 			}
-			handler = proxy
+			handler = applyLimitsMiddleware(proxy, subRule, wf.rule, wf.ipConnLimiter)
 
 		case "redirect":
 			handler = http.RedirectHandler(subRule.RedirectURL, http.StatusMovedPermanently)
@@ -167,29 +333,52 @@ func (wf *WebForwarder) Start() []*http.Server {
 			log.Printf("[WebForwarder] 规则 [%s] 的子规则 [%s] 服务类型未知: %s", wf.rule.Name, subRule.Name, subRule.ServiceType)
 			continue
 		}
+		if subRule.CorazaWAF != "无" && subRule.CorazaWAF != "" {
+			handler = wf.wafManager.Middleware(handler, subRule.CorazaWAF)
+		}
 
-		hostHandlers[subRule.FrontendAddress] = handler
-		hostToSubRule[subRule.FrontendAddress] = subRule
+		hostHandlers[subRule.FrontendAddress] = authMiddleware(handler, subRule.Auth)
+		wf.hostToSubRule[subRule.FrontendAddress] = subRule
 	}
 
 	mainHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		clientAddrWithPort := r.RemoteAddr
-
-		if wf.rule.AccessControl.Mode != "disabled" {
-			clientIP := strings.Split(clientAddrWithPort, ":")[0]
-			allowed, reason := wf.ipFilter.IsAllowed(clientIP, wf.rule.AccessControl)
-			if !allowed {
-				log.Printf("[%s] 拒绝请求: %s (%s)", wf.rule.Name, clientAddrWithPort, reason)
-				http.Error(w, "Forbidden", http.StatusForbidden)
-				return
-			}
-		}
-
+		clientIP := strings.Split(clientAddrWithPort, ":")[0]
 		host := strings.Split(r.Host, ":")[0]
-		if handler, ok := hostHandlers[host]; ok {
-			subRule := hostToSubRule[host]
-			ctx := context.WithValue(r.Context(), subRuleContextKey, subRule)
 
+		if handler, ok := hostHandlers[host]; ok {
+			subRule := wf.hostToSubRule[host]
+			logRuleName := fmt.Sprintf("%s %s", wf.rule.Name, subRule.Name)
+
+			if wf.rule.AccessControl.Mode != "disabled" {
+				allowed, reason := wf.ipFilter.IsAllowed(clientIP, wf.rule.AccessControl)
+				if !allowed {
+					log.Printf("[%s] 拒绝请求 (主规则): %s (%s)", wf.rule.Name, clientAddrWithPort, reason)
+					http.Error(w, "Forbidden", http.StatusForbidden)
+					return
+				}
+			}
+
+			if subRule.IPFilter.Mode != "disabled" {
+				allowed, reason := wf.ipFilter.IsAllowed(clientIP, subRule.IPFilter)
+				if !allowed {
+					log.Printf("[%s] 拒绝请求 (子规则): %s (%s)", logRuleName, clientAddrWithPort, reason)
+					http.Error(w, "Forbidden", http.StatusForbidden)
+					return
+				}
+			}
+
+			if subRule.CORSEnabled {
+				w.Header().Set("Access-Control-Allow-Origin", "*")
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+				if r.Method == "OPTIONS" {
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+			}
+
+			ctx := context.WithValue(r.Context(), subRuleContextKey, subRule)
 			if subRule.ForceHTTPS && r.TLS == nil {
 				target := "https://" + r.Host + r.URL.Path
 				if len(r.URL.RawQuery) > 0 {
@@ -199,14 +388,12 @@ func (wf *WebForwarder) Start() []*http.Server {
 				return
 			}
 
-			logRuleName := fmt.Sprintf("%s %s", wf.rule.Name, subRule.Name)
 			log.Printf("[%s] 处理请求: %s -> %s %s", logRuleName, clientAddrWithPort, r.Method, r.Host+r.RequestURI)
-
 			if conn, ok := r.Context().Value(connContextKey).(net.Conn); ok {
 				wf.connManager.UpdateSubRuleForConn(conn, subRule.Name, subRule.FrontendAddress)
 			}
-
 			handler.ServeHTTP(w, r.WithContext(ctx))
+
 		} else {
 			log.Printf("[%s] 请求未匹配子规则: %s -> %s %s", wf.rule.Name, clientAddrWithPort, r.Method, r.Host+r.RequestURI)
 
@@ -214,98 +401,140 @@ func (wf *WebForwarder) Start() []*http.Server {
 				wf.connManager.UpdateSubRuleForConn(conn, "未匹配", "未匹配")
 			}
 
-			http.Error(w, "Not Found", http.StatusNotFound)
+			switch wf.rule.UnmatchedRequest.Action {
+			case "close":
+				if hj, ok := w.(http.Hijacker); ok {
+					conn, _, err := hj.Hijack()
+					if err == nil {
+						conn.Close()
+					}
+				}
+			case "proxy":
+				target, err := url.Parse(wf.rule.UnmatchedRequest.ProxyAddress)
+				if err != nil {
+					log.Printf("[%s] 未匹配请求的代理地址无效: %v", wf.rule.Name, err)
+					http.Error(w, "Bad Gateway", http.StatusBadGateway)
+					return
+				}
+				proxy := httputil.NewSingleHostReverseProxy(target)
+				handler := applyLimitsMiddleware(proxy, WebSubRule{}, wf.rule, wf.ipConnLimiter)
+				handler.ServeHTTP(w, r)
+			case "redirect":
+				http.Redirect(w, r, wf.rule.UnmatchedRequest.RedirectURL, http.StatusFound)
+			case "static_text":
+				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+				w.Write([]byte(wf.rule.UnmatchedRequest.StaticText))
+			default:
+				http.Error(w, "Not Found", http.StatusNotFound)
+			}
 		}
 	})
 
 	var servers []*http.Server
 
-	startServer := func(network, listenAddr string) *http.Server {
+	startServer := func(network, listenAddr string) (*http.Server, error) {
 		server := &http.Server{
 			Addr:              listenAddr,
 			Handler:           mainHandler,
 			ReadHeaderTimeout: 15 * time.Second,
 			ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+				clientIP := strings.Split(c.RemoteAddr().String(), ":")[0]
+				limit := wf.rule.Limits.IPConnectionLimit
+
+				if limit > 0 && !wf.ipConnLimiter.Check(wf.rule.Name, clientIP, limit) {
+					log.Printf("[%s] 拒绝来自 %s 的新连接: 已达到主规则IP连接数限制 (%d)", wf.rule.Name, clientIP, limit)
+					c.Close()
+					ctx, cancel := context.WithCancel(ctx)
+					cancel()
+					return ctx
+				}
+
 				return context.WithValue(ctx, connContextKey, c)
 			},
 			ConnState: func(conn net.Conn, state http.ConnState) {
+				clientIP := strings.Split(conn.RemoteAddr().String(), ":")[0]
+				ruleName := wf.rule.Name
 				switch state {
 				case http.StateNew:
-					log.Printf("[%s] 新的Web连接: %s on %s", wf.rule.Name, conn.RemoteAddr().String(), conn.LocalAddr().String())
-					wf.connManager.AddHTTPConn(conn, wf.rule.Name, "")
+					wf.connManager.AddHTTPConn(conn, ruleName, "")
+					wf.ipConnLimiter.Increment(ruleName, clientIP)
 				case http.StateClosed, http.StateHijacked:
 					wf.connManager.RemoveByConn(conn)
+					wf.ipConnLimiter.Decrement(ruleName, clientIP)
 				}
 			},
 		}
 
+		var err error
 		if wf.rule.TLS.Enabled {
-			server.TLSConfig = buildTLSConfig(wf.rule.TLS)
+			server.TLSConfig, err = certManager.GetTLSConfig()
+			if err != nil {
+				log.Printf("[WebForwarder] 规则 [%s] 获取TLS配置失败: %v", wf.rule.Name, err)
+				return nil, err
+			}
+
+			ruleTLSConfig := buildTLSConfig(wf.rule.TLS)
+			server.TLSConfig.MinVersion = ruleTLSConfig.MinVersion
+			server.TLSConfig.NextProtos = ruleTLSConfig.NextProtos
 		}
 
-		go func() {
-			var err error
-			if wf.rule.TLS.Enabled {
-				certFile := "cert.pem"
-				keyFile := "key.pem"
-				if _, errStat := os.Stat(certFile); os.IsNotExist(errStat) {
-					log.Printf("[WebForwarder] 错误: 规则 [%s] 启用了TLS，但未找到 %s 或 %s。", wf.rule.Name, certFile, keyFile)
-					return
-				}
+		lc := getListenConfig()
 
-				if wf.rule.TLS.HTTP3Enabled {
-					log.Printf("[WebForwarder] 规则 [%s] 以HTTPS + HTTP/3模式启动。", wf.rule.Name)
-					h3Server := &http3.Server{
-						Addr:      server.Addr,
-						Handler:   server.Handler,
-						TLSConfig: server.TLSConfig,
-					}
-					err = h3Server.ListenAndServeTLS(certFile, keyFile)
-				} else {
-					lc := net.ListenConfig{
-						Control: func(network, address string, c syscall.RawConn) error {
-							var err error
-							if strings.HasPrefix(network, "tcp6") {
-								err = c.Control(func(fd uintptr) {
-									err = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IPV6, syscall.IPV6_V6ONLY, 1)
-								})
-							}
-							return err
-						},
-					}
-					listener, listenErr := lc.Listen(context.Background(), network, listenAddr)
-					if listenErr != nil {
-						log.Printf("[WebForwarder] 规则 [%s] 在 [%s] 监听失败: %v", wf.rule.Name, listenAddr, listenErr)
-						return
-					}
-					log.Printf("[WebForwarder] 规则 [%s] 以HTTPS (HTTP/2, HTTP/1.1)模式启动。", wf.rule.Name)
-					err = server.ServeTLS(listener, certFile, keyFile)
+		if wf.rule.TLS.Enabled {
+			if wf.rule.TLS.HTTP3Enabled {
+				log.Printf("==== Web 服务 [%s] 正在启动并尝试监听在 %s (HTTP/3) ====", wf.rule.Name, listenAddr)
+				h3Server := &http3.Server{
+					Addr:      server.Addr,
+					Handler:   server.Handler,
+					TLSConfig: server.TLSConfig,
 				}
+				go func() {
+					if err := h3Server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+						log.Printf("[WebForwarder] Web服务 [%s] 在 [%s] (HTTP/3) 发生错误: %v", wf.rule.Name, listenAddr, err)
+					}
+				}()
 			} else {
-				listener, listenErr := net.Listen(network, listenAddr)
+				listener, listenErr := lc.Listen(context.Background(), network, listenAddr)
 				if listenErr != nil {
-					log.Printf("[WebForwarder] 规则 [%s] 在 [%s] 监听失败: %v", wf.rule.Name, listenAddr, listenErr)
-					return
+					err = fmt.Errorf("[WebForwarder] 规则 [%s] 在 [%s] 监听失败: %v", wf.rule.Name, listenAddr, listenErr)
+					log.Println(err)
+					return nil, err
 				}
-				err = server.Serve(listener)
+
+				log.Printf("==== Web 服务 [%s] 已启动并成功监听在 %s (HTTPS) ====", wf.rule.Name, listenAddr)
+				go func() {
+					if err := server.ServeTLS(listener, "", ""); err != nil && err != http.ErrServerClosed {
+						log.Printf("[WebForwarder] Web服务 [%s] 在 [%s] (HTTPS) 发生错误: %v", wf.rule.Name, listenAddr, err)
+					}
+				}()
+			}
+		} else {
+			listener, listenErr := lc.Listen(context.Background(), network, listenAddr)
+			if listenErr != nil {
+				err = fmt.Errorf("[WebForwarder] 规则 [%s] 在 [%s] 监听失败: %v", wf.rule.Name, listenAddr, listenErr)
+				log.Println(err)
+				return nil, err
 			}
 
-			if err != nil && err != http.ErrServerClosed {
-				log.Printf("[WebForwarder] Web服务 [%s] 在 [%s] 发生错误: %v", wf.rule.Name, listenAddr, err)
-			}
-		}()
-		return server
+			log.Printf("==== Web 服务 [%s] 已启动并成功监听在 %s (HTTP) ====", wf.rule.Name, listenAddr)
+			go func() {
+				if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
+					log.Printf("[WebForwarder] Web服务 [%s] 在 [%s] (HTTP) 发生错误: %v", wf.rule.Name, listenAddr, err)
+				}
+			}()
+		}
+		return server, nil
 	}
 
 	if wf.rule.ListenAddr != "" {
 		addrWithZone := autoAppendZone(wf.rule.ListenAddr)
 		addr := net.JoinHostPort(addrWithZone, strconv.Itoa(wf.rule.ListenPort))
-		
+
 		network := "tcp"
 		if wf.rule.TLS.Enabled && wf.rule.TLS.HTTP3Enabled {
 			network = "udp"
 		}
-		if s := startServer(network, addr); s != nil {
+		if s, err := startServer(network, addr); err == nil {
 			servers = append(servers, s)
 		}
 	} else {
@@ -315,7 +544,7 @@ func (wf *WebForwarder) Start() []*http.Server {
 			if wf.rule.TLS.Enabled && wf.rule.TLS.HTTP3Enabled {
 				network = "udp4"
 			}
-			if s := startServer(network, addr); s != nil {
+			if s, err := startServer(network, addr); err == nil {
 				servers = append(servers, s)
 			}
 		}
@@ -325,7 +554,7 @@ func (wf *WebForwarder) Start() []*http.Server {
 			if wf.rule.TLS.Enabled && wf.rule.TLS.HTTP3Enabled {
 				network = "udp6"
 			}
-			if s := startServer(network, addr); s != nil {
+			if s, err := startServer(network, addr); err == nil {
 				servers = append(servers, s)
 			}
 		}

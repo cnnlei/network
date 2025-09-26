@@ -49,7 +49,7 @@ global_access_control:
 ip_lists:
     whitelists:
         全局白名单:
-            - 192.168.122.250
+            - 192.168.122.251
     blacklists:
         全局黑名单:
             - 2.2.2.2
@@ -68,120 +68,31 @@ rules:
     - name: test-all
       protocol: tcp,udp
       listen_addr: 0.0.0.0
-      listen_port: 80
-      forward_addr: 192.168.122.250
-      forward_port: 3389
-      access_control:
-        mode: disabled
-        list_name: admin-ips
-      enabled: true
-      rate_limit: 20
-    - name: test-tcp01
-      protocol: udp
-      listen_addr: ""
-      listen_port: 53536
-      forward_addr: 8.8.8.8
-      forward_port: 53
-      access_control:
-        mode: disabled
-        list_name: ""
-      enabled: true
-    - name: 端口转发
-      protocol: tcp
-      listen_addr: ""
-      listen_port: 2225
-      forward_addr: 192.168.122.250
-      forward_port: 3389
-      access_control:
-        mode: disabled
-        list_name: ""
-      enabled: true
-    - name: 测试
-      protocol: tcp6
-      listen_addr: '::'
       listen_port: 22226
       forward_addr: 192.168.122.250
       forward_port: 3389
       access_control:
         mode: disabled
-        list_name: ""
+        list_name: 全局白名单
       enabled: true
-    - name: 测试1
-      protocol: tcp
-      listen_addr: ""
-      listen_port: 2226
-      forward_addr: 192.168.122.250
-      forward_port: 80
-      access_control:
-        mode: disabled
-        list_name: ""
-      enabled: true
-    - name: ceshi2
-      protocol: tcp
-      listen_addr: ""
-      listen_port: 2227
-      forward_addr: 192.168.122.250
-      forward_port: 81
-      access_control:
-        mode: disabled
-        list_name: ""
-      enabled: true
-    - name: ceshi3
-      protocol: tcp
-      listen_addr: ""
-      listen_port: 2228
-      forward_addr: 192.168.122.250
-      forward_port: 9998
-      access_control:
-        mode: disabled
-        list_name: ""
-      enabled: true
-    - name: 测试4
-      protocol: tcp
-      listen_addr: ""
-      listen_port: 2229
-      forward_addr: 192.168.122.250
-      forward_port: 82
-      access_control:
-        mode: disabled
-        list_name: ""
-      enabled: true
-    - name: ceshi5
-      protocol: tcp
-      listen_addr: ""
-      listen_port: 2230
-      forward_addr: 192.168.122.250
-      forward_port: 3389
-      access_control:
-        mode: disabled
-        list_name: ""
-      enabled: true
-    - name: ceshi8
-      protocol: tcp
-      listen_addr: ""
-      listen_port: 22896
-      forward_addr: 192.168.122.250
-      forward_port: 308
-      access_control:
-        mode: disabled
-        list_name: ""
-      enabled: true
+      rate_limit: 1
+      connection_limit: 1
 web_services:
     - name: test-web
       enabled: true
       listen_ipv4: true
       listen_ipv6: true
-      listen_addr: fe80::ac2:a1ff:fe44:c7d8
-      listen_port: 82
+      listen_addr: ""
+      listen_port: 443
       access_control:
         mode: disabled
-        list_name: ""
+        list_name: 全局白名单
       security:
         block_on_404_count: 0
         block_on_block_count: 0
       tls:
-        enabled: false
-        min_version: TLS1.2
+        enabled: true
+        min_version: TLS1.3
         http3_enabled: false
         ech_enabled: false
       apply_to_sub_rules: false
@@ -196,19 +107,21 @@ web_services:
             send_speed_kbps: 0
             receive_speed_kbps: 0
         ip_connection_limit: 0
+      unmatched_request:
+        action: not_found
       sub_rules:
-        - name: "01"
+        - name: cnyun.de
           enabled: true
           service_type: reverse_proxy
           frontend_address: cnyun.de
           backend:
-            address: http://1.13.161.181:38707
+            address: http://192.168.122.49:8090
             ignore_tls_cert: false
             use_target_host_header: false
             grpc_secure: false
             disable_keep_alives: false
-          redirect_url: http://baidu.com
-          coraza_waf: 无
+          redirect_url: ""
+          coraza_waf: gf_simple_admin不允许
           security:
             block_on_404_count: 0
             block_on_coraza_count: 0
@@ -218,10 +131,15 @@ web_services:
             http_client_timeout_sec: 30
           client_ip:
             from_header: false
+            from_header_name: X-Forwarded-For
             add_to_header: false
             add_to_header_name: X-Forwarded-For
             add_proto_to_header: false
             add_proto_to_header_name: X-Forwarded-Proto
+            add_host_to_header: false
+            add_host_to_header_name: X-Forwarded-Host
+          forwarded_headers:
+            enabled: true
           cors_enabled: false
           auth:
             enabled: false
@@ -229,39 +147,111 @@ web_services:
             password: ""
           ip_filter:
             mode: disabled
-            list_name: ""
+            list_name: 全局白名单
           user_agent_filter:
             mode: disabled
             list: []
           custom_robot_txt: ""
           force_https: false
-    - name: 02test
-      enabled: true
-      listen_ipv4: true
-      listen_ipv6: true
-      listen_addr: ""
-      listen_port: 80
-      access_control:
-        mode: disabled
-        list_name: ""
-      security:
-        block_on_404_count: 0
-        block_on_block_count: 0
-      tls:
-        enabled: false
-        min_version: TLS1.2
-        http3_enabled: false
-        ech_enabled: false
-      apply_to_sub_rules: false
-      limits:
-        rule_rate_limit:
-            send_speed_kbps: 0
-            receive_speed_kbps: 0
-        connection_rate_limit:
-            send_speed_kbps: 0
-            receive_speed_kbps: 0
-        ip_rate_limit:
-            send_speed_kbps: 0
-            receive_speed_kbps: 0
-        ip_connection_limit: 0
-      sub_rules: []
+          limits:
+            rule_rate_limit:
+                send_speed_kbps: 0
+                receive_speed_kbps: 0
+            connection_rate_limit:
+                send_speed_kbps: 0
+                receive_speed_kbps: 0
+            ip_rate_limit:
+                send_speed_kbps: 0
+                receive_speed_kbps: 0
+            ip_connection_limit: 0
+tls:
+    enabled: true
+    cert_directory: ./certs
+    manual: []
+    acme:
+        enabled: true
+        accounts:
+            - name: test
+              provider: cloudflare
+              email: 5615151651@qq.com
+              cloudflare:
+                email: ""
+                api_key: ""
+                api_token: JUTA22H-J14t8YU3R1v5ovW3LLBg0Dfs53dfcMCP
+              domains:
+                - cnyun.de
+waf:
+    enabled: true
+    default_action: phase:2,deny,status:200
+    rule_sets:
+        - name: "1"
+          source: inline
+          path: ""
+          rules:
+            - |
+              SecRule ARGS "@rx (?i)union.+select" "id:1001,phase:2,msg:'Basic SQL Injection Attack Detected'"
+        - name: "2"
+          source: inline
+          path: ""
+          rules:
+            - SecRule ARGS "@rx (?i)<script.*>" "id:1002,phase:2,block,msg:'Basic XSS Attack Detected'"
+        - name: "3"
+          source: inline
+          path: ""
+          rules:
+            - SecRule ARGS:testwaf "@streq block" "id:1001,phase:2,block,msg:'WAF Test - Blocked by URL Parameter Rule'"
+        - name: "4"
+          source: inline
+          path: ""
+          rules:
+            - SecRule REQUEST_URI "@beginsWith /admin" "id:1002,phase:1,deny,status:404,msg:'Access to admin directory is forbidden'"
+        - name: "5"
+          source: inline
+          path: ""
+          rules:
+            - |
+              SecRule ARGS:testwaf "@contains block" "id:101,phase:2,deny,status:403,msg:'WAF Test Block Rule Triggered'"
+        - name: gf_simple_123
+          source: inline
+          path: ""
+          rules:
+            - SecAction "id:35664,phase:1,nolog,pass,setvar:tx.ratelimit_count_123=0"
+            - SecRule REQUEST_URI ".*" "id:35665,phase:2,nolog,pass,setvar:tx.ratelimit_count_123=+1,expirevar:tx.ratelimit_count_123=60"
+            - 'SecRule TX:ratelimit_count_123 "@gt 2" "id:35666,phase:2,deny,status:429,log,msg:''Simple Rule: Rate limit of 2/60s exceeded for *. Blocking for 300s.''"'
+        - name: aaaaaa
+          source: url
+          path: https://raw.githubusercontent.com/coreruleset/coreruleset/refs/heads/main/rules/RESPONSE-980-CORRELATION.conf
+          rules:
+            - ""
+        - name: bbbbbb
+          source: url
+          path: https://raw.githubusercontent.com/coreruleset/coreruleset/refs/heads/main/rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf
+          rules:
+            - ""
+        - name: "33333333333"
+          source: inline
+          path: ""
+          rules:
+            - |
+              # 初始化全局计数器（按 IP 拼接 key）
+              SecAction "id:1000,phase:1,nolog,pass"
+
+              # 每次访问，累加计数
+              SecRule REQUEST_HEADERS:Host "@rx .*" \
+                "id:1001,phase:2,pass,nolog,chain,setvar:tx.ratelimit_%{REMOTE_ADDR}=+1,expirevar:tx.ratelimit_%{REMOTE_ADDR}=60"
+                SecRule TX:ratelimit_%{REMOTE_ADDR} "@gt 2" \
+                  "phase:2,log,deny,status:429,msg:'Rate limit exceeded from %{REMOTE_ADDR}'"
+        - name: gf_simple_99999
+          source: inline
+          path: ""
+          rules:
+            - SecAction "id:1539,phase:1,nolog,pass,initcol:ip=%{REMOTE_ADDR}"
+            - SecRule IP:BLOCKED_1539 "@eq 1" "id:1540,phase:1,deny,status:403,log,msg:'IP %{REMOTE_ADDR} blocked for *'"
+            - SecRule REQUEST_URI "@rx ^.*$" "id:1541,phase:2,nolog,pass,setvar:ip.ratelimit_count_1539=+1,expirevar:ip.ratelimit_count_1539=60"
+            - SecRule IP:ratelimit_count_1539 "@gt 2" "id:1542,phase:2,log,deny,status:429,setvar:IP.BLOCKED_1539=1,expirevar:IP.BLOCKED_1539=300,msg:'Rate limit of 2/60s exceeded for *, blocking IP %{REMOTE_ADDR} for 300s.'"
+        - name: gf_simple_admin不允许
+          source: inline
+          path: ""
+          rules:
+            - 'SecRule REQUEST_URI "@beginsWith /admin" "id:63507,phase:1,deny,status:403,log,msg:''Simple Rule: Block directory /admin''"'
+    default_action_body: 维护中，请稍后重试

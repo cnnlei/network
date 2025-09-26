@@ -45,14 +45,12 @@ func NewConnectionManager() *ConnectionManager {
 		clients:     make(map[*websocket.Conn]bool),
 		nextConnID:  1,
 	}
-	// **FIX**: Start the cleanup goroutine to remove stale connections.
 	go m.startCleanupTask()
 	return m
 }
 
-// **NEW**: startCleanupTask periodically calls the cleanup function.
 func (m *ConnectionManager) startCleanupTask() {
-	ticker := time.NewTicker(10 * time.Second) // Check every 10 seconds
+	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 	for {
 		<-ticker.C
@@ -60,11 +58,10 @@ func (m *ConnectionManager) startCleanupTask() {
 	}
 }
 
-// **NEW**: cleanupStaleConnections removes connections that are stuck in "Matching..." state for too long.
 func (m *ConnectionManager) cleanupStaleConnections() {
 	m.mu.Lock()
 	var idsToClose []int64
-	staleThreshold := 15 * time.Second 
+	staleThreshold := 15 * time.Second
 	var connectionsToClose []net.Conn
 
 	for id, connInfo := range m.connections {
@@ -75,16 +72,15 @@ func (m *ConnectionManager) cleanupStaleConnections() {
 			}
 		}
 	}
-	m.mu.Unlock() // Unlock before closing connections to avoid deadlock
-	
+	m.mu.Unlock()
+
 	if len(idsToClose) > 0 {
 		log.Printf("[Manager] 清理 %d 个陈旧的 '匹配中' 连接", len(idsToClose))
 		for _, conn := range connectionsToClose {
-			conn.Close() // This will trigger RemoveByConn and its broadcast
+			conn.Close()
 		}
 	}
 }
-
 
 func readRecentLogs(filePath string, n int) (string, map[string][]string, error) {
 	file, err := os.Open(filePath)
@@ -106,13 +102,18 @@ func readRecentLogs(filePath string, n int) (string, map[string][]string, error)
 	recentLines := allLines[start:]
 
 	logsByRule := make(map[string][]string)
+	
 	re := regexp.MustCompile(`\[([^\]]+)\]`)
 
-	for _, line := range recentLines {
+	for _, line := range allLines {
+		if strings.Contains(line, "acme:") || strings.Contains(line, "[ACMEUser]") || strings.Contains(line, "[CertManager]") {
+			continue 
+		}
+
 		matches := re.FindStringSubmatch(line)
 		if len(matches) > 1 {
 			fullRuleName := matches[1]
-			if !strings.HasPrefix(fullRuleName, "Manager") && !strings.HasPrefix(fullRuleName, "IPFilter") {
+			if !strings.HasPrefix(fullRuleName, "Manager") && !strings.HasPrefix(fullRuleName, "IPFilter") && !strings.HasPrefix(fullRuleName, "LogJanitor") {
 				logsByRule[fullRuleName] = append(logsByRule[fullRuleName], line)
 			}
 		}
@@ -226,7 +227,7 @@ func (m *ConnectionManager) Disconnect(id int64) bool {
 
 	if ok && conn.conn != nil {
 		log.Printf("[Manager] 正在断开连接 ID: %d", id)
-		conn.conn.Close() // This will trigger RemoveByConn and its broadcast
+		conn.conn.Close()
 		return true
 	}
 	return false

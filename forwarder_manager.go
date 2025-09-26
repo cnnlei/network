@@ -27,7 +27,7 @@ type ForwarderManager struct {
 	connManager         *ConnectionManager
 	ipFilterManager     *IPFilterManager
 	cancelFuncs         map[string]context.CancelFunc
-	ruleStatus          map[string]string // Tracks runtime status ("running", "stopped", "error")
+	ruleStatus          map[string]string
 }
 
 func NewForwarderManager(connManager *ConnectionManager, ipFilterManager *IPFilterManager) *ForwarderManager {
@@ -85,15 +85,11 @@ func (fm *ForwarderManager) StartRule(rule Rule) {
 		}
 	}
 	
-	// **FIX**: If not all listeners started successfully, it's an error.
 	if !allSuccess {
-		// If at least one listener *did* succeed (partial failure), we need to stop it.
 		if atLeastOneSuccess {
 			log.Printf("[Manager] 规则 [%s] 部分启动失败，正在停止已成功的部分...", rule.Name)
-			// Calling StopRule will clean up everything and set status to "stopped".
 			fm.StopRule(rule.Name) 
 		}
-		// Regardless of partial success, the final state is an error.
 		fm.mu.Lock()
 		fm.ruleStatus[rule.Name] = "error"
 		fm.mu.Unlock()
@@ -131,7 +127,6 @@ func (fm *ForwarderManager) StopRule(ruleName string) {
 	fm.ruleStatus[ruleName] = "stopped"
 }
 
-// GetRuleStatuses returns the current runtime status of all port forwarding rules.
 func (fm *ForwarderManager) GetRuleStatuses(rules []Rule) map[string]string {
 	fm.mu.Lock()
 	defer fm.mu.Unlock()
@@ -164,7 +159,10 @@ func (fm *ForwarderManager) startTCPForwarder(ctx context.Context, rule Rule) bo
 		protocol = "tcp6"
 	}
 	
-	listener, err := net.Listen(protocol, rule.ListenAddress())
+	// ***** 核心修改：调用平台特定的函数来获取配置 *****
+	lc := getListenConfig()
+
+	listener, err := lc.Listen(ctx, protocol, rule.ListenAddress())
 	if err != nil {
 		log.Printf("错误: 无法为规则 [%s] 监听TCP端口 %s (%s): %v", rule.Name, rule.ListenAddress(), protocol, err)
 		return false

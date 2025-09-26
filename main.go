@@ -2,17 +2,20 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"flag"
 	"io"
 	"log"
 	"math"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gin-contrib/cors"
@@ -27,6 +30,8 @@ var (
 	forwarderManager *ForwarderManager
 	webManager       *WebManager
 	updater          *Updater
+	certManager      *CertManager
+	wafManager       *WAFManager
 	configPath       = flag.String("config", "config.yml", "Path to the main configuration file (config.yml)")
 )
 
@@ -252,6 +257,17 @@ rules:
     mode: disabled
   enabled: true
 web_services: []
+tls:
+  enabled: false
+waf:
+  enabled: true
+  default_action: "phase:2,deny,status:403,log"
+  rule_sets:
+  - name: "example-rules"
+    source: "inline"
+    rules:
+    - "SecRuleEngine On"
+    - "SecRule ARGS:testparam \"@contains test\" \"id:101,phase:2,block,msg:'Test rule triggered'\""
 `)
 		if err := os.WriteFile(*configPath, exampleConfig, 0644); err != nil {
 			log.Fatalf("创建示例 config.yml 失败: %v", err)
@@ -277,16 +293,25 @@ web_services: []
 	}
 	mw := io.MultiWriter(os.Stdout, logFile)
 	log.SetOutput(mw)
-	
+
 	logJanitor := NewLogJanitor()
 	logJanitor.Start()
 
 	log.Println("配置加载成功。")
 
+	certManager, err = NewCertManager(&currentConfig.TLS)
+	if err != nil {
+		log.Fatalf("初始化证书管理器失败: %v", err)
+	}
+	wafManager, err = NewWAFManager(&currentConfig.WAF, certManager.certDirectory)
+	if err != nil {
+		log.Fatalf("初始化 WAF 管理器失败: %v", err)
+	}
+
 	ipFilterManager = NewIPFilterManager(currentConfig)
 	connManager := NewConnectionManager()
 	forwarderManager = NewForwarderManager(connManager, ipFilterManager)
-	webManager = NewWebManager(ipFilterManager, connManager)
+	webManager = NewWebManager(ipFilterManager, connManager, NewIPConnectionLimiter(), wafManager)
 	updater = NewUpdater(ipFilterManager)
 
 	updater.Start()
@@ -295,13 +320,22 @@ web_services: []
 	for _, rule := range currentConfig.Rules {
 		forwarderManager.StartRule(rule)
 	}
-	
+
 	log.Println("准备启动Web服务...")
 	for _, rule := range currentConfig.WebServices {
 		webManager.StartRule(rule)
 	}
 
+	if currentConfig.WAF.Enabled {
+		log.Println("[WAFManager] WAF 功能已启用。")
+	} else {
+		log.Println("[WAFManager] WAF 功能已禁用。")
+	}
+
 	log.Println("所有服务已在后台启动。")
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	router := gin.Default()
 	router.Use(cors.New(cors.Config{
@@ -310,7 +344,6 @@ web_services: []
 		AllowHeaders:     []string{"Origin", "Content-Type", "Accept"},
 		AllowCredentials: true,
 	}))
-	
 	router.Use(func(c *gin.Context) {
 		if strings.HasPrefix(c.Request.URL.Path, "/api/") || c.Request.URL.Path == "/ws" {
 			clientIP := c.ClientIP()
@@ -321,7 +354,6 @@ web_services: []
 				return
 			}
 		}
-
 		if strings.HasPrefix(c.Request.URL.Path, "/api/") {
 			c.Writer.Header().Set("Content-Type", "application/json; charset=utf-8")
 		}
@@ -330,22 +362,182 @@ web_services: []
 
 	api := router.Group("/api")
 	{
-		// --- Settings API ---
-		api.GET("/settings", func(c *gin.Context) {
+		// --- TLS APIs ---
+		api.GET("/tls/certificates", func(c *gin.Context) {
+			certs, err := certManager.ListCertificates()
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "无法获取证书列表: " + err.Error()})
+				return
+			}
+			c.JSON(http.StatusOK, certs)
+		})
+		api.GET("/tls", func(c *gin.Context) {
 			configMutex.RLock()
 			defer configMutex.RUnlock()
-			c.JSON(http.StatusOK, currentConfig.Settings)
+			c.JSON(http.StatusOK, currentConfig.TLS)
 		})
-
-		api.PUT("/settings", func(c *gin.Context) {
-			var newSettings AppSettings
-			if err := c.ShouldBindJSON(&newSettings); err != nil {
+		api.PUT("/tls", func(c *gin.Context) {
+			var newTLSConfig TLSConfig
+			if err := c.ShouldBindJSON(&newTLSConfig); err != nil {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "无效的数据格式: " + err.Error()})
 				return
 			}
-			
 			configMutex.Lock()
-			currentConfig.Settings = newSettings
+			currentConfig.TLS = newTLSConfig
+			data, _ := yaml.Marshal(currentConfig)
+			err := os.WriteFile(*configPath, data, 0644)
+			configMutex.Unlock()
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "写入 config.yml 失败"})
+				return
+			}
+			certManager.UpdateTLSConfig(&newTLSConfig)
+			c.JSON(http.StatusOK, gin.H{"message": "TLS设置已热重载成功，新域名将在后台任务中自动处理。"})
+		})
+		api.POST("/tls/request-cert", func(c *gin.Context) {
+			domain := c.Query("domain")
+			if domain == "" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "缺少 'domain' 参数"})
+				return
+			}
+			go func() {
+				err := certManager.RequestCertificate(domain)
+				if err != nil {
+					log.Printf("[API] 为域 %s 请求证书失败: %v", domain, err)
+				}
+			}()
+			c.JSON(http.StatusOK, gin.H{"message": "已为域 " + domain + " 触发证书申请，请稍后查看日志。"})
+		})
+		// --- WAF APIs ---
+		api.GET("/waf/status", func(c *gin.Context) {
+			configMutex.RLock()
+			defer configMutex.RUnlock()
+			c.JSON(http.StatusOK, gin.H{"enabled": currentConfig.WAF.Enabled})
+		})
+		// NEW: Get/Set full WAF config
+		api.GET("/waf/config", func(c *gin.Context) {
+			configMutex.RLock()
+			defer configMutex.RUnlock()
+			c.JSON(http.StatusOK, currentConfig.WAF)
+		})
+		api.PUT("/waf/config", func(c *gin.Context) {
+			var newWAFConfig WAFConfig
+			if err := c.ShouldBindJSON(&newWAFConfig); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "无效的数据格式: " + err.Error()})
+				return
+			}
+
+			configMutex.Lock()
+			currentConfig.WAF = newWAFConfig
+			data, _ := yaml.Marshal(currentConfig)
+			err := os.WriteFile(*configPath, data, 0644)
+			configMutex.Unlock()
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "写入 config.yml 失败"})
+				return
+			}
+
+			// Hot reload WAF manager
+			newWafManager, err := NewWAFManager(&currentConfig.WAF, certManager.certDirectory)
+			if err != nil {
+				log.Printf("[WAFManager] 热重载失败: %v", err)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "WAF 配置热重载失败"})
+				return
+			}
+			wafManager = newWafManager
+			webManager.wafManager = wafManager // Update webManager's instance too
+
+			log.Println("[WAFManager] WAF 配置已热重载。")
+			c.JSON(http.StatusOK, gin.H{"message": "WAF 设置已保存并热重载。"})
+		})
+
+		api.POST("/waf/toggle", func(c *gin.Context) {
+			configMutex.Lock()
+			defer configMutex.Unlock()
+			currentConfig.WAF.Enabled = !currentConfig.WAF.Enabled
+			data, _ := yaml.Marshal(currentConfig)
+			if err := os.WriteFile(*configPath, data, 0644); err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "写入 config.yml 失败"})
+				return
+			}
+			if currentConfig.WAF.Enabled {
+				log.Println("[WAFManager] WAF 功能已切换为: 启用。")
+			} else {
+				log.Println("[WAFManager] WAF 功能已切换为: 禁用。")
+			}
+			c.JSON(http.StatusOK, gin.H{"enabled": currentConfig.WAF.Enabled})
+		})
+
+		api.GET("/waf/rulesets", func(c *gin.Context) {
+			configMutex.RLock()
+			defer configMutex.RUnlock()
+			c.JSON(http.StatusOK, currentConfig.WAF.RuleSets)
+		})
+		
+		// =================== START: ADDED CODE ===================
+		// This handler gets the actual rules from a specific ruleset, fetching from file/url if necessary.
+		api.GET("/waf/rulesets/:name/rules", func(c *gin.Context) {
+			name := c.Param("name")
+			if wafManager == nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "WAF Manager not initialized"})
+				return
+			}
+			
+			rules, err := wafManager.GetRuleSetRules(name)
+			if err != nil {
+				c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+				return
+			}
+			
+			// Ensure we return an empty array `[]` instead of `null` if there are no rules
+			if rules == nil {
+				rules = []string{}
+			}
+
+			c.JSON(http.StatusOK, rules)
+		})
+		// =================== END: ADDED CODE =====================
+
+		api.POST("/waf/rulesets", func(c *gin.Context) {
+			var newRuleSet WAFRuleSet
+			if err := c.ShouldBindJSON(&newRuleSet); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "无效的规则集数据: " + err.Error()})
+				return
+			}
+			configMutex.Lock()
+			currentConfig.WAF.RuleSets = append(currentConfig.WAF.RuleSets, newRuleSet)
+			data, _ := yaml.Marshal(currentConfig)
+			err := os.WriteFile(*configPath, data, 0644)
+			configMutex.Unlock()
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "写入 config.yml 失败"})
+				return
+			}
+			wafManager.loadRuleSet(newRuleSet) // Hot reload
+			c.JSON(http.StatusOK, newRuleSet)
+		})
+
+		api.PUT("/waf/rulesets/:name", func(c *gin.Context) {
+			ruleSetName := c.Param("name")
+			var updatedRuleSet WAFRuleSet
+			if err := c.ShouldBindJSON(&updatedRuleSet); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "无效的规则集数据: " + err.Error()})
+				return
+			}
+			configMutex.Lock()
+			found := false
+			for i, rs := range currentConfig.WAF.RuleSets {
+				if rs.Name == ruleSetName {
+					currentConfig.WAF.RuleSets[i] = updatedRuleSet
+					found = true
+					break
+				}
+			}
+			if !found {
+				configMutex.Unlock()
+				c.JSON(http.StatusNotFound, gin.H{"error": "未找到 WAF 规则集: " + ruleSetName})
+				return
+			}
 			data, _ := yaml.Marshal(currentConfig)
 			err := os.WriteFile(*configPath, data, 0644)
 			configMutex.Unlock()
@@ -354,16 +546,71 @@ web_services: []
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "写入 config.yml 失败"})
 				return
 			}
+
+			wafManager.loadRuleSet(updatedRuleSet) // Hot reload
+			c.JSON(http.StatusOK, updatedRuleSet)
+		})
+
+		api.DELETE("/waf/rulesets/:name", func(c *gin.Context) {
+			ruleSetName := c.Param("name")
+			configMutex.Lock()
+			foundIndex := -1
+			for i, rs := range currentConfig.WAF.RuleSets {
+				if rs.Name == ruleSetName {
+					foundIndex = i
+					break
+				}
+			}
+			if foundIndex == -1 {
+				configMutex.Unlock()
+				c.JSON(http.StatusNotFound, gin.H{"error": "未找到 WAF 规则集: " + ruleSetName})
+				return
+			}
+			currentConfig.WAF.RuleSets = append(currentConfig.WAF.RuleSets[:foundIndex], currentConfig.WAF.RuleSets[foundIndex+1:]...)
+			data, _ := yaml.Marshal(currentConfig)
+			err := os.WriteFile(*configPath, data, 0644)
+			configMutex.Unlock()
+
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "写入 config.yml 失败"})
+				return
+			}
+			// To-do: unload WAF from memory
+			c.JSON(http.StatusOK, gin.H{"message": "WAF 规则集 '" + ruleSetName + "' 已成功删除"})
+		})
+
+		// --- Settings API ---
+		api.GET("/settings", func(c *gin.Context) {
+			configMutex.RLock()
+			defer configMutex.RUnlock()
+			c.JSON(http.StatusOK, currentConfig) // Return full config now
+		})
+		api.PUT("/settings", func(c *gin.Context) {
+			var newConfig Config
+			if err := c.ShouldBindJSON(&newConfig); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "无效的数据格式: " + err.Error()})
+				return
+			}
+			configMutex.Lock()
+			currentConfig.Settings = newConfig.Settings
+			currentConfig.WAF = newConfig.WAF // Allow updating WAF through here as well
+			// ... handle other parts of config if needed ...
+			data, _ := yaml.Marshal(currentConfig)
+			err := os.WriteFile(*configPath, data, 0644)
+			configMutex.Unlock()
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "写入 config.yml 失败"})
+				return
+			}
 			c.JSON(http.StatusOK, gin.H{"message": "设置已保存。"})
 		})
-		
+
 		// --- Web Services APIs ---
 		api.GET("/web-rules", func(c *gin.Context) {
 			configMutex.RLock()
 			defer configMutex.RUnlock()
 			c.JSON(http.StatusOK, currentConfig.WebServices)
 		})
-
 		api.GET("/web-rules/status", func(c *gin.Context) {
 			configMutex.RLock()
 			rules := currentConfig.WebServices
@@ -371,8 +618,6 @@ web_services: []
 			statuses := webManager.GetRuleStatuses(rules)
 			c.JSON(http.StatusOK, statuses)
 		})
-
-
 		api.POST("/web-rules", func(c *gin.Context) {
 			var newRule WebServiceRule
 			if err := c.ShouldBindJSON(&newRule); err != nil {
@@ -390,13 +635,10 @@ web_services: []
 			currentConfig.WebServices = append(currentConfig.WebServices, newRule)
 			data, _ := yaml.Marshal(currentConfig)
 			os.WriteFile(*configPath, data, 0644)
-			
+			log.Printf("[Manager] 已添加新的Web服务规则 [%s]，正在启动服务...", newRule.Name)
 			webManager.StartRule(newRule)
-			
-			log.Printf("[Manager] 已添加并启动新的Web服务规则 [%s]", newRule.Name)
 			c.JSON(http.StatusOK, newRule)
 		})
-
 		api.PUT("/web-rules/:name", func(c *gin.Context) {
 			ruleName := c.Param("name")
 			var updatedRule WebServiceRule
@@ -406,10 +648,10 @@ web_services: []
 			}
 			configMutex.Lock()
 			defer configMutex.Unlock()
-			
 			found := false
 			for i, r := range currentConfig.WebServices {
 				if r.Name == ruleName {
+					log.Printf("[Manager] 已更新Web服务规则 [%s]，正在重启服务...", updatedRule.Name)
 					webManager.StopRule(r.Name)
 					currentConfig.WebServices[i] = updatedRule
 					webManager.StartRule(updatedRule)
@@ -421,20 +663,15 @@ web_services: []
 				c.JSON(http.StatusNotFound, gin.H{"error": "未找到Web服务规则: " + ruleName})
 				return
 			}
-
-			log.Printf("[Manager] 已更新Web服务规则 [%s]", updatedRule.Name)
 			data, _ := yaml.Marshal(currentConfig)
 			os.WriteFile(*configPath, data, 0644)
 			c.JSON(http.StatusOK, updatedRule)
 		})
-
 		api.DELETE("/web-rules/:name", func(c *gin.Context) {
 			ruleName := c.Param("name")
 			configMutex.Lock()
 			defer configMutex.Unlock()
-			
 			webManager.StopRule(ruleName)
-			
 			foundIndex := -1
 			for i, r := range currentConfig.WebServices {
 				if r.Name == ruleName {
@@ -452,7 +689,6 @@ web_services: []
 			log.Printf("[Manager] 已删除并停止Web服务规则 [%s]", ruleName)
 			c.JSON(http.StatusOK, gin.H{"message": "Web服务规则 '" + ruleName + "' 已成功删除"})
 		})
-		
 		api.POST("/web-rules/:name/toggle", func(c *gin.Context) {
 			ruleName := c.Param("name")
 			configMutex.Lock()
@@ -463,13 +699,12 @@ web_services: []
 				if r.Name == ruleName {
 					currentConfig.WebServices[i].Enabled = !r.Enabled
 					newState = currentConfig.WebServices[i].Enabled
-					
+					log.Printf("[Manager] Web服务规则 [%s] 状态已切换为: %v", ruleName, newState)
 					if newState {
 						webManager.StartRule(currentConfig.WebServices[i])
 					} else {
 						webManager.StopRule(r.Name)
 					}
-					
 					found = true
 					break
 				}
@@ -483,7 +718,6 @@ web_services: []
 			c.JSON(http.StatusOK, gin.H{"message": "Web服务规则 '" + ruleName + "' 状态已切换", "enabled": newState})
 		})
 
-		// --- Web Sub-Rules APIs ---
 		api.POST("/web-rules/:name/sub-rules", func(c *gin.Context) {
 			ruleName := c.Param("name")
 			var subRule WebSubRule
@@ -493,7 +727,6 @@ web_services: []
 			}
 			configMutex.Lock()
 			defer configMutex.Unlock()
-
 			var parentRule *WebServiceRule
 			for i, r := range currentConfig.WebServices {
 				if r.Name == ruleName {
@@ -508,20 +741,16 @@ web_services: []
 					break
 				}
 			}
-
 			if parentRule == nil {
 				c.JSON(http.StatusNotFound, gin.H{"error": "未找到父规则: " + ruleName})
 				return
 			}
-			
+			log.Printf("[Manager] 因新增子规则 [%s]，正在重启 Web 服务 [%s]", subRule.Name, ruleName)
 			webManager.RestartRule(*parentRule)
-
 			data, _ := yaml.Marshal(currentConfig)
 			os.WriteFile(*configPath, data, 0644)
-			log.Printf("[Manager] 已为 [%s] 添加子规则 [%s] 并重启服务", ruleName, subRule.Name)
 			c.JSON(http.StatusOK, subRule)
 		})
-
 		api.PUT("/web-rules/:name/sub-rules/:subRuleName", func(c *gin.Context) {
 			ruleName := c.Param("name")
 			subRuleName := c.Param("subRuleName")
@@ -532,7 +761,6 @@ web_services: []
 			}
 			configMutex.Lock()
 			defer configMutex.Unlock()
-
 			var parentRule *WebServiceRule
 			for i, r := range currentConfig.WebServices {
 				if r.Name == ruleName {
@@ -552,26 +780,21 @@ web_services: []
 					break
 				}
 			}
-
 			if parentRule == nil {
 				c.JSON(http.StatusNotFound, gin.H{"error": "未找到父规则: " + ruleName})
 				return
 			}
-			
+			log.Printf("[Manager] 因更新子规则 [%s]，正在重启 Web 服务 [%s]", updatedSubRule.Name, ruleName)
 			webManager.RestartRule(*parentRule)
-
 			data, _ := yaml.Marshal(currentConfig)
 			os.WriteFile(*configPath, data, 0644)
-			log.Printf("[Manager] 已更新子规则 [%s]@[%s] 并重启服务", subRuleName, ruleName)
 			c.JSON(http.StatusOK, updatedSubRule)
 		})
-
 		api.DELETE("/web-rules/:name/sub-rules/:subRuleName", func(c *gin.Context) {
 			ruleName := c.Param("name")
 			subRuleName := c.Param("subRuleName")
 			configMutex.Lock()
 			defer configMutex.Unlock()
-
 			var parentRule *WebServiceRule
 			for i, r := range currentConfig.WebServices {
 				if r.Name == ruleName {
@@ -591,30 +814,24 @@ web_services: []
 					break
 				}
 			}
-
 			if parentRule == nil {
 				c.JSON(http.StatusNotFound, gin.H{"error": "未找到父规则: " + ruleName})
 				return
 			}
-
+			log.Printf("[Manager] 因删除子规则 [%s]，正在重启 Web 服务 [%s]", subRuleName, ruleName)
 			webManager.RestartRule(*parentRule)
-
 			data, _ := yaml.Marshal(currentConfig)
 			os.WriteFile(*configPath, data, 0644)
-			log.Printf("[Manager] 已删除子规则 [%s]@[%s] 并重启服务", subRuleName, ruleName)
 			c.JSON(http.StatusOK, gin.H{"message": "子规则 '" + subRuleName + "' 已成功删除"})
 		})
-		
 		api.POST("/web-rules/:name/sub-rules/:subRuleName/toggle", func(c *gin.Context) {
 			ruleName := c.Param("name")
 			subRuleName := c.Param("subRuleName")
 			configMutex.Lock()
 			defer configMutex.Unlock()
-
 			var parentRule *WebServiceRule
 			var subRule *WebSubRule
 			var newState bool
-
 			for i, r := range currentConfig.WebServices {
 				if r.Name == ruleName {
 					parentRule = &currentConfig.WebServices[i]
@@ -627,30 +844,24 @@ web_services: []
 					break
 				}
 			}
-			
 			if parentRule == nil || subRule == nil {
 				c.JSON(http.StatusNotFound, gin.H{"error": "未找到规则或子规则"})
 				return
 			}
-			
 			subRule.Enabled = !subRule.Enabled
 			newState = subRule.Enabled
-			
+			log.Printf("[%s %s] 状态已切换为: %v 并重启服务", ruleName, subRuleName, newState)
 			webManager.RestartRule(*parentRule)
-
 			data, _ := yaml.Marshal(currentConfig)
 			os.WriteFile(*configPath, data, 0644)
-			log.Printf("[Manager] 已切换子规则 [%s]@[%s] 状态为: %v 并重启服务", subRuleName, ruleName, newState)
 			c.JSON(http.StatusOK, gin.H{"message": "子规则状态已切换", "enabled": newState})
 		})
 
-		// --- Rules APIs ---
 		api.GET("/rules", func(c *gin.Context) {
 			configMutex.RLock()
 			defer configMutex.RUnlock()
 			c.JSON(http.StatusOK, currentConfig.Rules)
 		})
-
 		api.GET("/rules/status", func(c *gin.Context) {
 			configMutex.RLock()
 			rules := currentConfig.Rules
@@ -658,8 +869,6 @@ web_services: []
 			statuses := forwarderManager.GetRuleStatuses(rules)
 			c.JSON(http.StatusOK, statuses)
 		})
-
-
 		api.POST("/rules", func(c *gin.Context) {
 			var newRule Rule
 			if err := c.ShouldBindJSON(&newRule); err != nil {
@@ -677,13 +886,10 @@ web_services: []
 			currentConfig.Rules = append(currentConfig.Rules, newRule)
 			data, _ := yaml.Marshal(currentConfig)
 			os.WriteFile(*configPath, data, 0644)
-			
 			forwarderManager.StartRule(newRule)
-			
 			log.Printf("[Manager] 已添加并启动新规则 [%s]", newRule.Name)
 			c.JSON(http.StatusOK, newRule)
 		})
-
 		api.PUT("/rules/:name", func(c *gin.Context) {
 			ruleName := c.Param("name")
 			var updatedRule Rule
@@ -714,15 +920,12 @@ web_services: []
 				c.JSON(http.StatusNotFound, gin.H{"error": "未找到规则: " + ruleName})
 				return
 			}
-			
 			forwarderManager.StartRule(updatedRule)
-			
 			log.Printf("[Manager] 已更新规则 [%s]", updatedRule.Name)
 			data, _ := yaml.Marshal(currentConfig)
 			os.WriteFile(*configPath, data, 0644)
 			c.JSON(http.StatusOK, updatedRule)
 		})
-
 		api.DELETE("/rules/:name", func(c *gin.Context) {
 			ruleName := c.Param("name")
 			configMutex.Lock()
@@ -745,7 +948,6 @@ web_services: []
 			os.WriteFile(*configPath, data, 0644)
 			c.JSON(http.StatusOK, gin.H{"message": "规则 '" + ruleName + "' 已成功删除"})
 		})
-		
 		api.POST("/rules/:name/toggle", func(c *gin.Context) {
 			ruleName := c.Param("name")
 			configMutex.Lock()
@@ -775,19 +977,18 @@ web_services: []
 			c.JSON(http.StatusOK, gin.H{"message": "规则 '" + ruleName + "' 状态已切换", "enabled": newState})
 		})
 
-		// --- Logs API ---
+		// --- LOGS APIs ---
 		api.GET("/logs", func(c *gin.Context) {
 			ruleFilter := c.Query("rule")
 			page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
-			pageSize, _ := strconv.Atoi(c.DefaultQuery("pageSize", "20"))
-
+			pageSize, _ := strconv.Atoi(c.DefaultQuery("pageSize", "50"))
 			if page < 1 {
 				page = 1
 			}
 			if pageSize < 1 {
-				pageSize = 20
+				pageSize = 50
 			}
-			
+
 			configMutex.RLock()
 			logPath := filepath.Join(currentConfig.Settings.LogDirectory, "forwarder.log")
 			configMutex.RUnlock()
@@ -799,24 +1000,27 @@ web_services: []
 			}
 			defer file.Close()
 
-			var allLines []string
+			var filteredLines []string
 			scanner := bufio.NewScanner(file)
-			filterTag := "[" + ruleFilter + "]"
-
 			for scanner.Scan() {
 				line := scanner.Text()
-				if ruleFilter == "" || ruleFilter == "all" || strings.Contains(line, filterTag) {
-					allLines = append(allLines, line)
+				if ruleFilter == "" || ruleFilter == "all" {
+					filteredLines = append(filteredLines, line)
+				} else {
+
+					re := regexp.MustCompile(`\[` + regexp.QuoteMeta(ruleFilter) + `(\s|\])`)
+					if re.MatchString(line) {
+						filteredLines = append(filteredLines, line)
+					}
 				}
 			}
 
-			reverseLines(allLines)
+			reverseLines(filteredLines)
 
-			totalLogs := len(allLines)
+			totalLogs := len(filteredLines)
 			totalPages := int(math.Ceil(float64(totalLogs) / float64(pageSize)))
 			start := (page - 1) * pageSize
 			end := start + pageSize
-
 			if start > totalLogs {
 				start = totalLogs
 			}
@@ -824,7 +1028,7 @@ web_services: []
 				end = totalLogs
 			}
 
-			paginatedLogs := allLines[start:end]
+			paginatedLogs := filteredLines[start:end]
 
 			c.JSON(http.StatusOK, gin.H{
 				"logs":        paginatedLogs,
@@ -834,17 +1038,153 @@ web_services: []
 			})
 		})
 
+		api.GET("/logs/waf", func(c *gin.Context) {
+			page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+			pageSize, _ := strconv.Atoi(c.DefaultQuery("pageSize", "50"))
+			if page < 1 {
+				page = 1
+			}
+			if pageSize < 1 {
+				pageSize = 50
+			}
+
+			configMutex.RLock()
+			logPath := filepath.Join(currentConfig.Settings.LogDirectory, "waf_audit.log")
+			configMutex.RUnlock()
+
+			file, err := os.Open(logPath)
+			if err != nil {
+				if os.IsNotExist(err) {
+					c.JSON(http.StatusOK, gin.H{
+						"logs":        []string{},
+						"currentPage": 1,
+						"totalPages":  0,
+						"totalLogs":   0,
+					})
+					return
+				}
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "无法打开WAF日志文件"})
+				return
+			}
+			defer file.Close()
+
+			var wafLogs []string
+			scanner := bufio.NewScanner(file)
+			for scanner.Scan() {
+				wafLogs = append(wafLogs, scanner.Text())
+			}
+
+			reverseLines(wafLogs)
+
+			totalLogs := len(wafLogs)
+			totalPages := int(math.Ceil(float64(totalLogs) / float64(pageSize)))
+			start := (page - 1) * pageSize
+			end := start + pageSize
+			if start > totalLogs {
+				start = totalLogs
+			}
+			if end > totalLogs {
+				end = totalLogs
+			}
+
+			paginatedLogs := wafLogs[start:end]
+
+			c.JSON(http.StatusOK, gin.H{
+				"logs":        paginatedLogs,
+				"currentPage": page,
+				"totalPages":  totalPages,
+				"totalLogs":   totalLogs,
+			})
+		})
+
+		api.GET("/logs/cert-manager", func(c *gin.Context) {
+			page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+			pageSize, _ := strconv.Atoi(c.DefaultQuery("pageSize", "50"))
+			if page < 1 {
+				page = 1
+			}
+			if pageSize < 1 {
+				pageSize = 50
+			}
+
+			configMutex.RLock()
+			logPath := filepath.Join(currentConfig.Settings.LogDirectory, "forwarder.log")
+			configMutex.RUnlock()
+
+			file, err := os.Open(logPath)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "无法打开日志文件"})
+				return
+			}
+			defer file.Close()
+
+			var certLogs []string
+			scanner := bufio.NewScanner(file)
+			for scanner.Scan() {
+				line := scanner.Text()
+				if strings.Contains(line, "[CertManager]") || strings.Contains(line, "[API]") || strings.Contains(line, "acme:") || strings.Contains(line, "[ACMEUser]") {
+					certLogs = append(certLogs, line)
+				}
+			}
+
+			reverseLines(certLogs)
+
+			totalLogs := len(certLogs)
+			totalPages := int(math.Ceil(float64(totalLogs) / float64(pageSize)))
+			start := (page - 1) * pageSize
+			end := start + pageSize
+			if start > totalLogs {
+				start = totalLogs
+			}
+			if end > totalLogs {
+				end = totalLogs
+			}
+
+			paginatedLogs := certLogs[start:end]
+
+			c.JSON(http.StatusOK, gin.H{
+				"logs":        paginatedLogs,
+				"currentPage": page,
+				"totalPages":  totalPages,
+				"totalLogs":   totalLogs,
+			})
+		})
+
+		api.GET("/logs/domain/:domain", func(c *gin.Context) {
+			domain := c.Param("domain")
+
+			configMutex.RLock()
+			logPath := filepath.Join(currentConfig.Settings.LogDirectory, "forwarder.log")
+			configMutex.RUnlock()
+
+			file, err := os.Open(logPath)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "无法打开日志文件"})
+				return
+			}
+			defer file.Close()
+
+			var domainLogs []string
+			scanner := bufio.NewScanner(file)
+			for scanner.Scan() {
+				line := scanner.Text()
+				if strings.Contains(line, domain) {
+					domainLogs = append(domainLogs, line)
+				}
+			}
+			reverseLines(domainLogs)
+			c.JSON(http.StatusOK, domainLogs)
+		})
+
 		api.POST("/logs/cleanup", func(c *gin.Context) {
 			var req LogCleanupRequest
 			if err := c.ShouldBindJSON(&req); err != nil {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "无效的请求数据: " + err.Error()})
 				return
 			}
-
 			configMutex.RLock()
 			logPath := filepath.Join(currentConfig.Settings.LogDirectory, "forwarder.log")
 			configMutex.RUnlock()
-			
 			err := performCleanup(logPath, req)
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "日志清理失败: " + err.Error()})
@@ -853,27 +1193,23 @@ web_services: []
 			c.JSON(http.StatusOK, gin.H{"message": "日志清理任务已成功执行。"})
 		})
 
-		// --- Actions API ---
 		api.POST("/actions/restart", func(c *gin.Context) {
-			log.Println("[Manager] 收到重启请求，服务将在1秒后退出...")
+			log.Println("[Manager] 收到重启请求，服务将在1秒后优雅退出...")
 			c.JSON(http.StatusOK, gin.H{"message": "服务正在重启..."})
 			go func() {
 				time.Sleep(1 * time.Second)
-				os.Exit(0)
+				stop()
 			}()
 		})
-		
-		// --- IP Lists APIs ---
+
 		api.GET("/ip-lists", func(c *gin.Context) {
 			configMutex.RLock()
 			defer configMutex.RUnlock()
 			c.JSON(http.StatusOK, currentConfig.IPLists)
 		})
-
 		api.GET("/ip-lists/status", func(c *gin.Context) {
 			ipFilterManager.mu.RLock()
 			defer ipFilterManager.mu.RUnlock()
-
 			statuses := make(map[string]gin.H)
 			for name, list := range ipFilterManager.lists {
 				statuses[name] = gin.H{
@@ -883,18 +1219,15 @@ web_services: []
 			}
 			c.JSON(http.StatusOK, statuses)
 		})
-		
 		api.GET("/ip-lists/file/:name", func(c *gin.Context) {
 			listName := c.Param("name")
 			configMutex.RLock()
 			filePath := filepath.Join(currentConfig.Settings.IPListDirectory, listName+".txt")
 			configMutex.RUnlock()
-			
 			if _, err := os.Stat(filePath); os.IsNotExist(err) {
 				c.JSON(http.StatusNotFound, gin.H{"error": "缓存文件未找到，请先至少更新一次。"})
 				return
 			}
-
 			data, err := os.ReadFile(filePath)
 			if err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "读取缓存文件失败: " + err.Error()})
@@ -902,21 +1235,17 @@ web_services: []
 			}
 			c.String(http.StatusOK, string(data))
 		})
-		
 		api.POST("/ip-lists/add", func(c *gin.Context) {
 			var req AddIPRequest
 			if err := c.ShouldBindJSON(&req); err != nil {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "无效的请求数据: " + err.Error()})
 				return
 			}
-
 			configMutex.Lock()
 			defer configMutex.Unlock()
-
 			var list []string
 			var ok bool
 			var listUpdated bool
-			
 			checkAndAppend := func(l []string) ([]string, bool) {
 				for _, ip := range l {
 					if ip == req.IP {
@@ -925,7 +1254,6 @@ web_services: []
 				}
 				return append(l, req.IP), true
 			}
-
 			switch req.Category {
 			case "whitelists":
 				if list, ok = currentConfig.IPLists.Whitelists[req.ListName]; ok {
@@ -940,84 +1268,94 @@ web_services: []
 					currentConfig.IPLists.IPSets[req.ListName], listUpdated = checkAndAppend(list)
 				}
 			}
-
 			if !ok {
 				c.JSON(http.StatusNotFound, gin.H{"error": "未找到名为 '" + req.ListName + "' 的名单，或该名单不支持手动添加。"})
 				return
 			}
-			
 			if !listUpdated {
 				c.JSON(http.StatusOK, gin.H{"message": "IP " + req.IP + " 已存在于名单 '" + req.ListName + "' 中"})
 				return
 			}
-
 			data, _ := yaml.Marshal(currentConfig)
 			if err := os.WriteFile(*configPath, data, 0644); err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "写入配置文件失败"})
 				return
 			}
-
 			ipFilterManager.UpdateAllManualLists(currentConfig.IPLists)
 			c.JSON(http.StatusOK, gin.H{"message": "成功将IP " + req.IP + " 添加到名单 '" + req.ListName + "'"})
 		})
-		
 		api.PUT("/ip-lists", func(c *gin.Context) {
 			var newIPLists IPLists
 			if err := c.ShouldBindJSON(&newIPLists); err != nil {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "无效的数据格式: " + err.Error()})
 				return
 			}
-			
 			configMutex.Lock()
 			defer configMutex.Unlock()
-			
 			existingNames := make(map[string]bool)
-			for name := range newIPLists.Whitelists { existingNames[name] = true }
-			for name := range newIPLists.Blacklists { existingNames[name] = true }
-			for name := range newIPLists.IPSets { existingNames[name] = true }
-			for name := range newIPLists.CountryIPLists { existingNames[name] = true }
-			for name := range newIPLists.UrlIpSets { existingNames[name] = true }
+			for name := range newIPLists.Whitelists {
+				existingNames[name] = true
+			}
+			for name := range newIPLists.Blacklists {
+				existingNames[name] = true
+			}
+			for name := range newIPLists.IPSets {
+				existingNames[name] = true
+			}
+			for name := range newIPLists.CountryIPLists {
+				existingNames[name] = true
+			}
+			for name := range newIPLists.UrlIpSets {
+				existingNames[name] = true
+			}
 
-			for name := range currentConfig.IPLists.CountryIPLists { 
-				if !existingNames[name] { 
+			for name := range currentConfig.IPLists.CountryIPLists {
+				if !existingNames[name] {
 					ipFilterManager.RemoveList(name)
 					filePath := filepath.Join(currentConfig.Settings.IPListDirectory, name+".txt")
 					os.Remove(filePath)
-				} 
+				}
 			}
-			for name := range currentConfig.IPLists.UrlIpSets { 
-				if !existingNames[name] { 
+			for name := range currentConfig.IPLists.UrlIpSets {
+				if !existingNames[name] {
 					ipFilterManager.RemoveList(name)
 					filePath := filepath.Join(currentConfig.Settings.IPListDirectory, name+".txt")
 					os.Remove(filePath)
-				} 
+				}
 			}
 
-			for name := range currentConfig.IPLists.Whitelists { if !existingNames[name] { ipFilterManager.RemoveList(name) } }
-			for name := range currentConfig.IPLists.Blacklists { if !existingNames[name] { ipFilterManager.RemoveList(name) } }
-			for name := range currentConfig.IPLists.IPSets { if !existingNames[name] { ipFilterManager.RemoveList(name) } }
-			
+			for name := range currentConfig.IPLists.Whitelists {
+				if !existingNames[name] {
+					ipFilterManager.RemoveList(name)
+				}
+			}
+			for name := range currentConfig.IPLists.Blacklists {
+				if !existingNames[name] {
+					ipFilterManager.RemoveList(name)
+				}
+			}
+			for name := range currentConfig.IPLists.IPSets {
+				if !existingNames[name] {
+					ipFilterManager.RemoveList(name)
+				}
+			}
+
 			currentConfig.IPLists = newIPLists
 			data, _ := yaml.Marshal(currentConfig)
 			if err := os.WriteFile(*configPath, data, 0644); err != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "写入配置文件失败"})
 				return
 			}
-
 			ipFilterManager.UpdateAllManualLists(currentConfig.IPLists)
 			go updater.runUpdateCycle()
-
 			log.Println("[Manager] IP名单配置已更新并立即生效。")
 			c.JSON(http.StatusOK, currentConfig.IPLists)
 		})
-		
 		api.POST("/ip-lists/:name/refresh", func(c *gin.Context) {
 			listName := c.Param("name")
 			configMutex.RLock()
-			
 			var listConfig *IPListConfig
 			var ok bool
-	
 			allDynamicLists := make(map[string]*IPListConfig)
 			for name, config := range currentConfig.IPLists.CountryIPLists {
 				allDynamicLists[name] = config
@@ -1025,15 +1363,12 @@ web_services: []
 			for name, config := range currentConfig.IPLists.UrlIpSets {
 				allDynamicLists[name] = config
 			}
-	
 			listConfig, ok = allDynamicLists[listName]
 			configMutex.RUnlock()
-	
 			if !ok {
 				c.JSON(http.StatusNotFound, gin.H{"error": "未找到动态IP名单: " + listName})
 				return
 			}
-	
 			go func() {
 				if err := updater.updateList(listName, listConfig); err == nil {
 					log.Printf("[API] 已成功为名单 '%s' 触发手动刷新。", listName)
@@ -1041,10 +1376,8 @@ web_services: []
 					log.Printf("[API] 为名单 '%s' 触发手动刷新失败: %v", listName, err)
 				}
 			}()
-	
 			c.JSON(http.StatusOK, gin.H{"message": "已触发对名单 '" + listName + "' 的后台刷新。"})
 		})
-		
 		api.POST("/connections/:id/disconnect", func(c *gin.Context) {
 			idStr := c.Param("id")
 			id, err := strconv.ParseInt(idStr, 10, 64)
@@ -1058,13 +1391,11 @@ web_services: []
 				c.JSON(http.StatusNotFound, gin.H{"error": "未找到连接 " + idStr})
 			}
 		})
-		
 		api.GET("/global-acl", func(c *gin.Context) {
 			configMutex.RLock()
 			defer configMutex.RUnlock()
 			c.JSON(http.StatusOK, currentConfig.GlobalAccessControl)
 		})
-
 		api.PUT("/global-acl", func(c *gin.Context) {
 			var newGlobalAC GlobalAccessControl
 			if err := c.ShouldBindJSON(&newGlobalAC); err != nil {
@@ -1086,8 +1417,41 @@ web_services: []
 
 	router.GET("/ws", func(c *gin.Context) { connManager.ServeWs(c.Writer, c.Request) })
 
-	log.Println("Web API 和 WebSocket 服务器启动于 http://localhost:8080")
-	if err := router.Run(":8080"); err != nil {
-		log.Fatalf("启动 Web 服务器失败: %v", err)
+	srv := &http.Server{
+		Addr:    ":8080",
+		Handler: router,
 	}
+
+	go func() {
+		log.Println("Web API 和 WebSocket 服务器启动于 http://localhost:8080")
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("启动 Web 服务器失败: %v", err)
+		}
+	}()
+
+	<-ctx.Done()
+	stop()
+
+	log.Println("收到关停信号，正在准备关闭服务...")
+
+	configMutex.RLock()
+	allRules := currentConfig.Rules
+	allWebRules := currentConfig.WebServices
+	configMutex.RUnlock()
+
+	for _, rule := range allRules {
+		forwarderManager.StopRule(rule.Name)
+	}
+	for _, rule := range allWebRules {
+		webManager.StopRule(rule.Name)
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Fatalf("Web服务器强制关闭失败: %v", err)
+	}
+
+	log.Println("所有服务已成功关闭。")
 }
